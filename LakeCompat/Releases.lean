@@ -201,17 +201,24 @@ private def lookup (fetch : Fetch) (endpoint target repo : String) (package subD
   let index ← ofExcept (indexBuilds index builds target)
   return ranked index target
 
+private def registrySource (url : String) (package scope : Option String) : Except String (String × String) := do
+  let some (owner, repo) := Source.githubRepo? url
+    | throw "Reservoir lookup requires an identifiable GitHub repository."
+  let pkg := (package.filter (!·.isEmpty)).getD repo
+  let org := (scope.filter (!·.isEmpty)).getD owner
+  unless identifier pkg && identifier org do throw "Invalid Reservoir package identifier."
+  return (s!"{registry}/{encode org}/{encode pkg}", owner ++ "/" ++ repo)
+
+def supportsLookup (url : String) (package scope : Option String) : Bool :=
+  (registrySource url package scope).isOk
+
 /-- Look up one Git package and rank revisions with evidence for the exact target toolchain. -/
 def suggestVersions (url target : String) (package scope subDir : Option String := none)
     (fetch : Fetch := fetchJson) : IO Json := do
-  let some (owner, repo) := Source.githubRepo? url
-    | return result "unsupported" "Reservoir lookup requires an identifiable GitHub repository."
-  let pkg := (package.filter (!·.isEmpty)).getD repo
-  let org := (scope.filter (!·.isEmpty)).getD owner
-  unless identifier pkg && identifier org do
-    return result "unsupported" "Invalid Reservoir package identifier."
-  let endpoint := s!"{registry}/{encode org}/{encode pkg}"
-  match ← (lookup fetch endpoint target (owner ++ "/" ++ repo) (package.filter (!·.isEmpty)) subDir).toBaseIO with
+  let (endpoint, repo) ← match registrySource url package scope with
+    | .ok source => pure source
+    | .error message => return result "unsupported" message
+  match ← (lookup fetch endpoint target repo (package.filter (!·.isEmpty)) subDir).toBaseIO with
   | .ok value => return value
   | .error err =>
     let message := match err with

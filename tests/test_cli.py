@@ -30,7 +30,14 @@ class CliTests(unittest.TestCase):
         }
         for directory, name, entries in [(package, "lib", []), (self.project, "app", [entry])]:
             (directory / "lake-manifest.json").write_text(
-                json.dumps({"name": name, "version": "1.2.0", "packages": entries})
+                json.dumps(
+                    {
+                        "name": name,
+                        "version": "1.2.0",
+                        "packagesDir": ".lake/packages",
+                        "packages": entries,
+                    }
+                )
             )
         (self.project / "lean-toolchain").write_text("v4.19.0")
 
@@ -45,6 +52,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("app -> lib", output)
             self.assertIn("Build not run", output)
+            self.assertIn("Use --suggest", output)
             code, raw = self.call("--json", "--strict")
             self.assertEqual(code, 1)
             self.assertIn("toolchain_mismatch", {f["kind"] for f in json.loads(raw)["findings"]})
@@ -166,11 +174,49 @@ class CliTests(unittest.TestCase):
             self.assertIn("trial uses the current lock", output)
             self.assertIn("Build unavailable", output)
 
+    def test_demo_does_not_prompt_for_git_suggestions_on_a_path_dependency(self):
+        result = cli("4.36.0", "--demo", check=True)
+        self.assertIn("upgradeDemo -> greeting", result.stdout)
+        self.assertNotIn("--suggest", result.stdout)
+
+    def test_no_suggestion_hint_for_unsupported_remote(self):
+        lock = self.project / "lake-manifest.json"
+        manifest = json.loads(lock.read_text())
+        manifest["packages"][0]["url"] = "https://gitlab.com/example/lib"
+        lock.write_text(json.dumps(manifest))
+        code, output = self.call()
+        self.assertEqual(code, 0)
+        self.assertNotIn("--suggest", output)
+        code, raw = self.call("--suggest", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(raw)["suggestions"]["lib"]["status"], "unsupported")
+
+    def test_cli_build_timeout_reaches_the_build(self):
+        path = self.tool(
+            "elan",
+            "import sys, time\n"
+            "if sys.argv[-1] == 'build':\n"
+            "    print('build started', flush=True)\n"
+            "    time.sleep(5)",
+        )
+        (self.project / "lakefile.toml").touch()
+        with patch.dict(os.environ, PATH=path):
+            code, raw = self.call("--verify", "--json", "--build-timeout=1")
+        self.assertEqual(code, 2)
+        result = json.loads(raw)["verification"]
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertIn("1-second", result["message"])
+        self.assertIn("build started", result["output"])
+
     def test_parse_errors_are_machine_readable(self):
         for args in [
             ("--demo",),
             ("--try-revision", "lib=main"),
             ("--unknown",),
+            ("--project=",),
+            ("--build-timeout",),
+            ("--build-timeout", "0"),
+            ("--build-timeout=0.5",),
             ("--try-revision", "lib=" + self.old, "--try-revision", "lib=" + self.new),
         ]:
             code, output = self.call("--json", *args)

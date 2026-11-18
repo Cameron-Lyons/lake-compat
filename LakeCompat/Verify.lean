@@ -17,9 +17,9 @@ private def run (args : Array String) (cwd : FilePath) (env : Environment) (ms :
     throw <| IO.userError s!"Verification exceeded its {limit} command timeout."
   return result
 
-private def confirmGit (root : FilePath) (pins : Pins) (env : Environment) (detail : IO.Ref Json) : IO Unit := do
+private def confirmGit (packagesDir : FilePath) (pins : Pins) (env : Environment) (detail : IO.Ref Json) : IO Unit := do
   for (name, expected) in pins do
-    let repo := root / ".lake" / "packages" / name
+    let repo := packagesDir / name
     unless (← (repo / ".git").symlinkMetadata.toBaseIO).toOption.any (·.type == .dir) &&
         (← IO.FS.realPath repo) == repo do
       throw <| IO.userError s!"Lake did not materialize an isolated checkout of {name}."
@@ -35,6 +35,36 @@ private def writeInput (dst : FilePath) (value : String) : IO Unit := do
   if (← metadata? dst).isSome then IO.FS.removeFile dst
   IO.FS.writeFile dst value
 
+/-- Older locks can leave the packages directory to the project configuration. Ask the target
+Lake to evaluate it in a separate copy before allowing Lake to materialize any dependencies. -/
+private def configuredPackagesDir (project parent : FilePath) (target : String) (lake : Array String)
+    (env : Environment) (detail : IO.Ref Json) : IO FilePath := do
+  let probe := parent / "config"
+  if (← metadata? (project / "lakefile.lean")).isSome then
+    copySources project probe
+  else
+    -- Declarative TOML needs only the lakefile. A custom cache can be large or contain links.
+    let config ← IO.FS.realPath (project / "lakefile.toml")
+    let info ← config.metadata
+    unless isInside project config && info.type == .file && info.byteSize.toNat ≤ sourceByteLimit do
+      throw <| IO.userError "Cannot read an in-tree lakefile.toml to determine packagesDir."
+    IO.FS.createDir probe
+    IO.FS.writeFile (probe / "lakefile.toml") (← IO.FS.readFile config)
+  writeInput (probe / "lean-toolchain") (target ++ "\n")
+  let output := parent / "resolved-config.toml"
+  let result ← run (lake ++ #["translate-config", "toml", output.toString]) probe env 30000 detail
+  if result.exitCode != 0 then
+    detail.modify (·.setObjVal! "output" (.str result.output))
+    throw <| IO.userError "Lake could not determine packagesDir from the configuration. Regenerate the manifest with its packagesDir recorded."
+  -- Lake's TOML printer emits top-level keys first and uses JSON-compatible quoted strings.
+  for line in (← IO.FS.readFile output).splitOn "\n" do
+    if line.trimAsciiStart.startsWith "[" then break
+    let some sep := line.find? '=' | continue
+    if (line.sliceTo sep).trimAscii == "packagesDir".toSlice then
+      let path ← IO.ofExcept <| Json.parse (line.sliceFrom sep.next!).copy >>= Json.getStr?
+      return ⟨path⟩
+  return ".lake/packages"
+
 private def verifyTrial (parent project : FilePath) (target : String) (revisions : Pins)
     (buildTimeoutMs : Nat) (detail : IO.Ref Json) : IO Json := do
   let env ← trialEnvironment target parent
@@ -44,8 +74,7 @@ private def verifyTrial (parent project : FilePath) (target : String) (revisions
     return report "unavailable" s!"Cannot run Lake with installed toolchain {target}."
       (Json.mkObj [("output", .str version.output)])
   let workspace := parent / "project"
-  copySources project workspace
-  let trial ← loadTrial workspace revisions
+  let trial ← prepareTrial project workspace revisions (configuredPackagesDir project parent target lake env detail)
   trial.checkLocalPaths workspace false
   let pinFile := workspace / "lean-toolchain"
   let lockFile := workspace / manifestName
@@ -69,7 +98,7 @@ private def verifyTrial (parent project : FilePath) (target : String) (revisions
       return report "inconclusive" "Lake could not confirm the project has default build targets." (← detail.get)
   if (← metadata? (workspace / ".lake" / "package-overrides.json")).isSome then
     throw <| IO.userError "The build created package overrides; the trial manifest cannot confirm effective pins."
-  confirmGit workspace trial.pins env detail
+  confirmGit (workspace / trial.packagesDir) trial.pins env detail
   trial.checkLocalPaths workspace true
   let checked := Json.mkObj (trial.pins.toList.map fun (name, rev) => (name, .str rev))
   return report "passed" s!"Default targets built on {target} with the trial pins."
@@ -91,9 +120,11 @@ private partial def removeTrialTree (path : FilePath) (repairPermissions := fals
 
 end Verify
 
+def defaultBuildTimeoutSeconds : Nat := 600
+
 /-- Verify the default build on an installed Elan toolchain using an isolated working-source copy. -/
 def verifyBuild (project : FilePath) (target : String) (revisions : Array (String × String) := #[])
-    (buildTimeoutMs : Nat := 600000) : IO Json := do
+    (buildTimeoutMs : Nat := defaultBuildTimeoutSeconds * 1000) : IO Json := do
   if Platform.isWindows then return Verify.report "unavailable" "Build verification requires a POSIX host."
   if target.isEmpty || target.startsWith "-" || target.any Char.isWhitespace || target.contains (Char.ofNat 0) then
     return Verify.report "inconclusive" "Invalid elan toolchain name."

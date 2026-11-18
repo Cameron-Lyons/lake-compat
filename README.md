@@ -26,7 +26,7 @@ From the project's root, run `lake --keep-toolchain update lake-compat`, then `l
 
 ## Read a scan
 
-The scan reads the project's `lake-manifest.json`, including legacy versions 5–7 and current 1.x manifests. For a Git dependency, it checks the checkout's revision and reads its toolchain and manifest from the locked commit. Local path dependencies use the working tree until their paths enter a locked Git checkout. Scans with Git dependencies use `readlink` on POSIX or Windows PowerShell to follow workspace symlinks in those paths. Missing checkouts and unverifiable Git revisions appear as findings, including in `--strict` mode. On a fresh checkout, an ordinary `lake build` on the project's current toolchain materializes its dependencies.
+The scan reads the project's `lake-manifest.json`, including legacy versions 5–7 and current 1.x manifests. It reads each Git dependency's toolchain and manifest from its locked commit whenever that commit is present locally. If the checkout points at a different commit, the report also flags the mismatch. Local path dependencies use the working tree until their paths enter a locked Git checkout. Scans with Git dependencies use `readlink` on POSIX or Windows PowerShell to follow workspace symlinks in those paths. Missing checkouts and unverifiable Git revisions appear as findings, including in `--strict` mode. On a fresh checkout, an ordinary `lake build` on the project's current toolchain materializes its dependencies.
 
 For example, in the Lean RealWorld application, `realworld -> jose -> json` identifies the dependency that selected a different JSON revision. The diagnostic includes both full commits. A mismatch is a reason to test the combination. The application may already build with that override. [RealWorld dependency configuration](https://github.com/saviorand/lean-realworld-example-app/tree/483d47e1d3c797098ac55cbf23a95072f7a6b6e5)
 
@@ -46,7 +46,11 @@ Build trials require Git, a POSIX host, and the target already installed in elan
 
 A successful trial checks that Lake retained the trial manifest and toolchain and that the resulting Git checkouts match every expected revision. With `--json`, `trial_revisions` lists requested changes and `verification.checked_revisions` records the full set of Git pins in a passing build. To adopt a passing trial, update `lean-toolchain` and the relevant requirements in your project's `lakefile.toml` or `lakefile.lean`, regenerate the manifest with Lake, and verify the resulting lock.
 
-Automatic trials test one combination and hold the dependency graph fixed. If an upgrade adds a dependency, use Lake to resolve that changed graph on an upgrade branch. The verifier supports standard `.lake/packages` layouts, in-tree path dependencies, and relative symlinks to files or directories within the copied source. External path dependencies, package overrides, and links that cannot be reproduced in the snapshot yield an inconclusive result. The build timeout is 10 minutes and the source snapshot limit is 1 GiB.
+Automatic trials test one combination and hold the dependency graph fixed. If an upgrade adds a dependency, use Lake to resolve that changed graph on an upgrade branch. The verifier supports the standard `.lake` metadata directory, in-tree package directories, in-tree path dependencies, and relative symlinks within the copied source. Lake materializes fresh checkouts in the trial's package directory. If you keep other source files alongside those checkouts in a directory such as `vendor/`, the trial copies them too. External path dependencies, package overrides, and links that cannot be reproduced in the snapshot yield an inconclusive result.
+
+If a manifest omits `packagesDir`, an offline scan looks for checkouts in the default packages directory. For build trials with Git or copied dependencies, the target Lake must support `translate-config` to resolve the omitted directory in a temporary copy. The trial records the resulting project-relative path before fetching or copying packages.
+
+The source snapshot limit is 1 GiB. The `lake build` step has a ten-minute timeout by default. Use `--build-timeout SECONDS` with any build trial to change it. For example, `lake-compat 4.36.0 --verify --build-timeout 1800` allows half an hour for compilation.
 
 ## Exit codes
 

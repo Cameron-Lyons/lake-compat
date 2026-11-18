@@ -66,6 +66,8 @@ class VerifyBuildTests(unittest.TestCase):
             "assert 'LEAN_SYSROOT' not in os.environ\n"
             "if sys.argv[4] == '--version':\n"
             "    print('Lake version for test toolchain')\n"
+            "elif sys.argv[4] == 'translate-config':\n"
+            "    pathlib.Path(sys.argv[-1]).write_text('name = \"app\"\\n')\n"
             "elif sys.argv[4] == 'build':\n"
             f"    assert pathlib.Path.cwd() != pathlib.Path({str(self.project)!r}).resolve()\n"
             f"    assert pathlib.Path('lean-toolchain').read_text().strip() == {self.target!r}\n"
@@ -96,7 +98,8 @@ class VerifyBuildTests(unittest.TestCase):
             "for index in range(24):\n"
             "    script = pathlib.Path(f'module-{index}/build.sh')\n"
             "    assert script.read_text() == f'echo {index}\\n' and os.access(script, os.X_OK)\n"
-            "pathlib.Path('Main.lean').write_text('-- changed during build')\nprint('done')")
+            "pathlib.Path('Main.lean').write_text('-- changed during build')\nprint('done')"
+        )
         original = self.lock.read_bytes()
         report = verify_build(self.project, self.target)
         self.assertEqual(report["status"], "passed", report)
@@ -111,18 +114,204 @@ class VerifyBuildTests(unittest.TestCase):
         self.assertEqual(report["status"], "inconclusive")
         self.assertIn("changed", report["message"])
 
-    def test_build_with_implicit_empty_packages(self):
+    def use_installed_toolchain(self):
         self.elan.unlink()
         target = (REPO / "lean-toolchain").read_text().strip()
-        if not shutil.which("elan") or subprocess.run(
-                ["elan", "run", target, "lake", "--version"], capture_output=True).returncode:
+        if (
+            not shutil.which("elan")
+            or subprocess.run(
+                ["elan", "run", target, "lake", "--version"], capture_output=True, check=False
+            ).returncode
+        ):
             self.skipTest("requires the project toolchain installed in elan")
+        return target
+
+    def test_build_with_implicit_empty_packages(self):
+        target = self.use_installed_toolchain()
         self.lock.write_text(json.dumps({"name": "app", "version": "1.1.0"}))
         (self.project / "lakefile.toml").write_text(
-            'name = "app"\ndefaultTargets = ["Main"]\n\n[[lean_lib]]\nname = "Main"\n')
+            'name = "app"\ndefaultTargets = ["Main"]\n\n[[lean_lib]]\nname = "Main"\n'
+        )
         result = verify_build(self.project, target)
         self.assertEqual(result["status"], "passed", result)
         self.assertEqual(result["checked_revisions"], {})
+
+    def test_build_in_custom_package_cache(self):
+        target = self.use_installed_toolchain()
+        repo = self.root / "greeting"
+        shutil.copytree(
+            REPO / "examples/upgrade-demo/greeting", repo, ignore=shutil.ignore_patterns(".lake")
+        )
+        base = repo / "base"
+        base.mkdir()
+        (base / "lakefile.toml").write_text('name = "base"\n[[lean_lib]]\nname = "Base"\n')
+        (base / "Base.lean").write_text('def baseGreeting := "hello"\n')
+        with (repo / "lakefile.toml").open("a") as lakefile:
+            lakefile.write('\n[[require]]\nname = "base"\npath = "base"\n')
+        (repo / "Greeting.lean").write_text("import Base\ndef greeting := baseGreeting\n")
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "greeting",
+            ],
+            cwd=repo,
+            check=True,
+        )
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        cache = "vendor"
+        local = self.project / cache / "local"
+        local.mkdir(parents=True)
+        (local / "lakefile.toml").write_text('name = "local"\n[[lean_lib]]\nname = "Local"\n')
+        (local / "Local.lean").write_text('def localGreeting := "local"\n')
+        (local.parent / "message.txt").write_text("source data")
+        (self.project / "lakefile.toml").write_text(
+            f'name = "app"\npackagesDir = "{cache}"\ndefaultTargets = ["Main"]\n'
+            f'[[require]]\nname = "greeting"\ngit = {json.dumps(str(repo))}\nrev = "{revision}"\n'
+            '[[require]]\nname = "local"\npath = "vendor/local"\n'
+            '[[lean_lib]]\nname = "Main"\n'
+        )
+        (self.project / "Main.lean").write_text(
+            "import Greeting\nimport Local\nexample : String := greeting ++ localGreeting\n"
+            'example : (include_str "vendor/message.txt") = "source data" := rfl\n'
+        )
+        self.manifest["packagesDir"] = cache
+        self.manifest["packages"] = [
+            {
+                "name": "greeting",
+                "type": "git",
+                "url": str(repo),
+                "rev": revision,
+                "inputRev": revision,
+                "configFile": "lakefile.toml",
+            },
+            {
+                "name": "base",
+                "type": "path",
+                "dir": cache + "/greeting/base",
+                "inherited": True,
+                "configFile": "lakefile.toml",
+            },
+            {"name": "local", "type": "path", "dir": "vendor/local", "configFile": "lakefile.toml"},
+        ]
+        self.save_manifest()
+        checkout = self.project / cache / "greeting"
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                if existing:
+                    subprocess.run(["git", "clone", "-q", repo, checkout], check=True)
+                    (checkout / "Greeting.lean").write_text("local edits\n")
+                    (checkout / "scratch").symlink_to(self.root)
+                result = verify_build(self.project, target)
+                self.assertEqual(result["status"], "passed", result)
+                self.assertEqual(result["checked_revisions"], {"greeting": revision})
+                if existing:
+                    self.assertEqual((checkout / "Greeting.lean").read_text(), "local edits\n")
+                else:
+                    self.assertFalse(checkout.exists())
+
+    def test_custom_cache_refreshes_copied_packages_with_inherited_paths(self):
+        target = self.use_installed_toolchain()
+        source = self.project / "source"
+        nested = source / "nested"
+        nested.mkdir(parents=True)
+        (source / "lakefile.toml").write_text(
+            'name = "copied"\n[[require]]\nname = "nested"\npath = "nested"\n'
+            '[[lean_lib]]\nname = "Copied"\n'
+        )
+        (source / "Copied.lean").write_text("import Nested\ndef message := nestedMessage\n")
+        (nested / "lakefile.toml").write_text('name = "nested"\n[[lean_lib]]\nname = "Nested"\n')
+        (nested / "Nested.lean").write_text('def nestedMessage := "current"\n')
+        cached = self.project / "vendor/copied"
+        shutil.copytree(source, cached)
+        (cached / "nested/Nested.lean").write_text('def nestedMessage := "stale"\n')
+        (self.project / "lakefile.toml").write_text(
+            'name = "app"\npackagesDir = "vendor"\ndefaultTargets = ["Main"]\n'
+            '[[require]]\nname = "copied"\npath = "source"\ncopy = true\n'
+            '[[lean_lib]]\nname = "Main"\n'
+        )
+        self.manifest["packagesDir"] = "vendor"
+        self.manifest["packages"] = [
+            {
+                "name": "copied",
+                "type": "path",
+                "dir": "source",
+                "copy": True,
+                "configFile": "lakefile.toml",
+            },
+            {
+                "name": "nested",
+                "type": "path",
+                "dir": "vendor/copied/nested",
+                "inherited": True,
+                "configFile": "lakefile.toml",
+            },
+        ]
+        self.save_manifest()
+        main = self.project / "Main.lean"
+        main.write_text('import Copied\nexample : message = "current" := rfl\n')
+        result = verify_build(self.project, target)
+        self.assertEqual(result["status"], "passed", result)
+        self.assertIn("stale", (cached / "nested/Nested.lean").read_text())
+
+        del self.manifest["packagesDir"]
+        self.save_manifest()
+        main.write_text('import Copied\nexample : message = "stale" := rfl\n')
+        result = verify_build(self.project, target)
+        self.assertEqual(result["status"], "failed", result)
+        self.assertIn("Main.lean", result["output"])
+        self.assertIn("stale", (cached / "nested/Nested.lean").read_text())
+
+    def test_implicit_external_cache_is_rejected_before_materialization(self):
+        target = self.use_installed_toolchain()
+        external = self.root / "external packages"
+        source = self.project / "source"
+        source.mkdir()
+        (source / "lakefile.toml").write_text('name = "dep"\n')
+        self.manifest["packages"] = [
+            {
+                "name": "dep",
+                "type": "path",
+                "dir": "source",
+                "copy": True,
+                "configFile": "lakefile.toml",
+            }
+        ]
+        self.save_manifest()
+        (self.project / "lakefile.toml").unlink()
+        directory = json.dumps(str(external))
+        toml = (
+            f'name = "app"\npackagesDir = {directory}\n'
+            '[[require]]\nname = "dep"\npath = "source"\ncopy = true\n'
+        )
+        lean = f'import Lake\nopen Lake DSL\npackage app where\n  packagesDir := {directory}\nrequire dep from "source"\n'
+        for filename, contents in [("lakefile.toml", toml), ("lakefile.lean", lean)]:
+            with self.subTest(filename=filename):
+                config = self.project / filename
+                config.write_text(contents)
+                result = verify_build(self.project, target)
+                self.assertEqual(result["status"], "inconclusive", result)
+                self.assertIn("project-relative", result["message"])
+                self.assertFalse(external.exists())
+                config.unlink()
+
+    def test_package_cache_must_be_project_relative(self):
+        for path in (str(self.root), "../elsewhere", ".", ".git/objects"):
+            with self.subTest(path=path):
+                self.manifest["packagesDir"] = path
+                self.save_manifest()
+                result = verify_build(self.project, self.target)
+                self.assertEqual(result["status"], "inconclusive", result)
+                self.assertIn("packagesDir", result["message"])
 
     def test_build_failure_includes_only_bounded_tail(self):
         self.write_elan("print('a' * 24000 + ' ERROR at Main.lean:3')\nsys.exit(2)")
@@ -259,7 +448,8 @@ class VerifyBuildTests(unittest.TestCase):
             f"os.link({str(marker)!r}, directory / 'hard-link')\n"
             f"(directory / 'external-link').symlink_to({str(external)!r})\n"
             "directory.chmod(0o500)\n"
-            "directory.parent.chmod(0o500)")
+            "directory.parent.chmod(0o500)"
+        )
         result = verify_build(self.project, self.target)
         self.assertEqual(result["status"], "passed", result)
         self.assertFalse(Path(temp_path.read_text()).parent.exists())
@@ -288,6 +478,11 @@ class VerifyBuildTests(unittest.TestCase):
         for folder in ("core", "postgres"):
             (git_repo / folder).mkdir()
             (git_repo / folder / "lakefile.lean").write_text("-- package")
+        (git_repo / "nested/inner/app").mkdir(parents=True)
+        (git_repo / "nested/inner/app/input").touch()
+        (git_repo / "nested/child").mkdir()
+        (git_repo / "nested/child/lakefile.lean").write_text("-- inherited package")
+        (git_repo / "alias").symlink_to("nested/inner/app")
         git("add", ".")
         git(
             "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "dep"
@@ -303,6 +498,12 @@ class VerifyBuildTests(unittest.TestCase):
                 "subDir": "postgres",
             },
             {"name": "core", "type": "path", "dir": ".lake/packages/dep-postgres/postgres/../core"},
+            {
+                "name": "child",
+                "type": "path",
+                "dir": ".lake/packages/dep-postgres/alias/../../child",
+                "inherited": True,
+            },
             {"name": "local", "type": "path", "dir": "vendor/mirror/../local"},
         ]
         (self.project / "vendor/mirror").mkdir(parents=True)

@@ -1,4 +1,5 @@
 import Std.Data.HashMap
+import Std.Data.HashSet
 import LakeCompat.Concurrent
 
 open System
@@ -80,8 +81,12 @@ private def copyBatches (batches : Array (Array String × FilePath)) : IO Unit :
   discard <| mapConcurrent batches fun (files, toDir) => do
     discard <| IO.Process.run {cmd := "cp", args := (#["-Pp"] ++ files).push toDir.toString}
 
-def copySources (source destination : FilePath) : IO Unit := do
+def sourceByteLimit := 1024 ^ 3
+
+def copySources (source destination : FilePath) (packagesDir : FilePath := ".lake/packages")
+    (managedPackages : Std.HashSet String := ∅) : IO Unit := do
   if isInside source destination then throw <| IO.userError "The temporary directory must be outside the project."
+  let packageCache := source / packagesDir
   IO.FS.createDir destination
   let mut stack := #[(source, destination)]
   let mut totalBytes := 0
@@ -91,7 +96,7 @@ def copySources (source destination : FilePath) : IO Unit := do
     let mut files := #[]
     let mut argBytes := 0
     for entry in ← dir.readDir do
-      if excluded entry.fileName then continue
+      if excluded entry.fileName || (dir == packageCache && managedPackages.contains entry.fileName) then continue
       if batches.size >= 16 then
         copyBatches batches
         batches := #[]
@@ -105,7 +110,7 @@ def copySources (source destination : FilePath) : IO Unit := do
       | .file | .symlink =>
         if info.type == .file then
           totalBytes := totalBytes + info.byteSize.toNat
-          if totalBytes > 1024 ^ 3 then throw <| IO.userError "Project sources exceed the 1 GiB temporary-copy limit."
+          if totalBytes > sourceByteLimit then throw <| IO.userError "Project sources exceed the 1 GiB temporary-copy limit."
         files := files.push entry.path.toString
         argBytes := argBytes + entry.path.toString.utf8ByteSize + 1
         if argBytes >= 32768 then
