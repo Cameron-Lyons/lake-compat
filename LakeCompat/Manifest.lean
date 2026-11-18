@@ -1,0 +1,145 @@
+import Lean.Data.Json.Parser
+import Lean.Data.Json.Printer
+import Std.Data.TreeMap
+
+namespace LakeCompat
+open Lean System
+
+private def wordChar (c : Char) : Bool :=
+  c.isAlphanum || c == '_' || Lean.isLetterLike c
+
+/-- Expand official Elan release and channel abbreviations while keeping linked toolchains intact. -/
+def normalizeToolchain (value : String) : Except String String := do
+  let value := value.trimAscii.copy
+  let invalid := s!"invalid Lean toolchain {repr value}"
+  let (origin, version) ← match value.splitOn ":" with
+    | [version] => pure (none, version)
+    | [origin, version] => do
+      let [owner, repo] := origin.splitOn "/" | throw invalid
+      unless [owner, repo].all (fun p => !p.isEmpty && p.all (fun c => wordChar c || ".-".contains c)) do
+        throw invalid
+      pure (some origin, version)
+    | _ => throw invalid
+  unless !version.isEmpty && version.all (fun c => wordChar c || ".+-".contains c) do throw invalid
+  if let some origin := origin then
+    if origin != "leanprover/lean4" then return value
+  let bare := (version.dropPrefix "v").copy
+  let core := (bare.takeWhile (fun c => c.isDigit || c == '.')).copy
+  let suffix := (bare.dropPrefix core).copy
+  let numbers := core.splitOn "."
+  let isRelease := numbers.length == 3 &&
+    numbers.all (fun s => !s.isEmpty && s.all Char.isDigit) &&
+    (suffix.isEmpty || (suffix.length > 1 && (suffix.front == '-' || suffix.front == '+')))
+  if isRelease then return "leanprover/lean4:v" ++ bare
+  if origin.isSome || ["stable", "nightly", "beta"].contains version || version.startsWith "nightly-" then
+    return "leanprover/lean4:" ++ version
+  return value
+
+/-- Directory spelling of a package name as serialized by Lake. -/
+def packageName (value : String) : Except String String := do
+  let name := (value.replace "«" "").replace "»" ""
+  if name.isEmpty || name == "." || name == ".." ||
+      name.any (fun c => c == '/' || c == '\\' || c == Char.ofNat 0) then
+    throw s!"invalid package name {repr value}"
+  return name
+
+inductive LockedSource where
+  | git (url revision : String) (subDir inputRev : Option String)
+  | path (dir : String) (copy : Bool)
+  deriving Inhabited
+
+def LockedSource.revision? : LockedSource → Option String
+  | .git _ rev .. => some rev
+  | .path .. => none
+
+structure LockedPackage where
+  name : String
+  scope : String
+  inherited : Bool
+  manifestFile : Option String
+  source : LockedSource
+  deriving Inhabited
+
+abbrev PackageMap := Std.TreeMap String LockedPackage
+
+structure Lock where
+  name : Option String
+  lakeDir : String
+  packagesDir : Option String
+  fixedToolchain : Bool
+  packages : PackageMap
+
+def manifestName := "lake-manifest.json"
+
+private def stringField (obj : Json) (key : String) : Except String String := do
+  let some s := (obj.getObjValD key).getStr?.toOption | throw s!"expected a non-empty string for {key}"
+  if s.isEmpty || s.contains (Char.ofNat 0) then throw s!"expected a non-empty string for {key}"
+  return s
+
+private def optionalString (obj : Json) (key : String) : Except String (Option String) :=
+  if obj.getObjValD key == .null then pure none else some <$> stringField obj key
+
+private def boolField (obj : Json) (key : String) (fallback : Option Bool := none) : Except String Bool :=
+  match (obj.getObjVal? key).toOption, fallback with
+  | none, some b => pure b
+  | some (.bool b), _ => pure b
+  | _, _ => throw s!"expected a boolean for {key}"
+
+/-- Unwrap a package without discarding fields needed to write an updated trial lock. -/
+def unpackEntry (raw : Json) : Except String (String × Json × Bool) := do
+  let obj ← raw.getObj?.mapError fun _ => "expected a package object"
+  match obj.toList with
+    | [(k, v)] => if k == "path" || k == "git" then pure (k, v, true)
+                   else throw "expected a package with a source type"
+    | _ => pure (← stringField raw "type", raw, false)
+
+private def decodePackage (raw : Json) : Except String LockedPackage := do
+  let (kind, fields, legacy) ← unpackEntry raw
+  let name ← packageName (← stringField fields "name")
+  let inherited ← boolField fields "inherited"
+  let copy ← boolField fields "copy" (some false)
+  let scope ← match (fields.getObjVal? "scope").toOption with
+    | none => pure ""
+    | some v => v.getStr?.mapError fun _ => s!"expected a string for {name}.scope"
+  let manifestFile ← if (fields.getObjVal? "manifestFile").isOk then optionalString fields "manifestFile"
+                     else pure (some manifestName)
+  let subDir ← optionalString fields (if legacy then "subDir?" else "subDir")
+  let inputRev ← optionalString fields (if legacy then "inputRev?" else "inputRev")
+  let source ← match kind with
+    | "git" => pure <| LockedSource.git (← stringField fields "url") (← stringField fields "rev") subDir inputRev
+    | "path" => pure <| LockedSource.path (← stringField fields "dir") copy
+    | _ => throw s!"unknown source type for {name}: {kind}"
+  return { name, scope, inherited, manifestFile, source }
+
+private def supportedVersion : Json → Bool
+  | .num n => [5, 6, 7].contains n
+  | .str version =>
+    match (version.takeWhile (· != '-')).copy.splitOn "." with
+    | ["1", minor, patch] => [minor, patch].all fun s => !s.isEmpty && s.all Char.isDigit
+    | _ => false
+  | _ => false
+
+/-- Decode the semantic-versioned lock and the earlier tagged formats used by Lake. -/
+def Lock.ofJson (file : FilePath) (raw : Json) : Except String Lock := Except.mapError (s!"{file}: {·}") <| do
+  unless raw.getObj?.isOk do throw "expected a Lake manifest object"
+  let version := (raw.getObjVal? "version").toOption.getD (raw.getObjValD "schemaVersion")
+  unless supportedVersion version do throw s!"unsupported Lake manifest version {version.compress}"
+  let name ← optionalString raw "name"
+  let lakeDir := (← optionalString raw "lakeDir").getD ".lake"
+  let packagesDir ← optionalString raw "packagesDir"
+  let fixedToolchain ← boolField raw "fixedToolchain" (some false)
+  let entries ← match (raw.getObjVal? "packages").toOption with
+    | none => pure #[]
+    | some v => v.getArr?.mapError fun _ => "expected a packages array"
+  let mut packages : PackageMap := ∅
+  for entry in entries do
+    let p ← decodePackage entry
+    if packages.contains p.name then throw s!"duplicate package {repr p.name}"
+    packages := packages.insert p.name p
+  return ⟨name, lakeDir, packagesDir, fixedToolchain, packages⟩
+
+def Lock.parse (file : FilePath) (contents : String) : Except String Lock := do
+  let raw ← (Json.parse contents).mapError (s!"{file}: {·}")
+  Lock.ofJson file raw
+
+end LakeCompat

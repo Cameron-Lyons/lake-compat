@@ -4,9 +4,32 @@ description = "Explain and test dependency upgrades in Lean 4 projects"
 keywords = ["lake", "dependencies", "toolchain", "upgrades"]
 license = "Apache-2.0"
 defaultTargets = ["lake-compat"]
-testDriver = "«lake-compat»"
-testDriverArgs = ["4.36.0", "--demo"]
+testDriver = "«lake-compat-tests»"
+
+[[input_dir]]
+name = "demoSources"
+path = "examples/upgrade-demo"
+text = true
+filter = { fileName = ["Main.lean", "Greeting.lean", "lakefile.toml", "lake-manifest.json", "lean-toolchain"] }
+
+[[lean_lib]]
+name = "LakeCompat"
+needs = ["demoSources"]
+
+[[lean_lib]]
+name = "LeanTests"
+globs = ["LeanTests.+"]
 
 [[lean_exe]]
 name = "lake-compat"
 root = "LakeCompatMain"
+# The CLI reads metadata and runs Lake in a child process. It never elaborates Lean.
+moreLinkArgs = ["-linitialize_minimal"]
+
+[[lean_exe]]
+name = "lake-compat-tests"
+root = "LeanTests.Main"
+
+[[lean_exe]]
+name = "verify-test-driver"
+root = "LeanTests.VerifyDriver"

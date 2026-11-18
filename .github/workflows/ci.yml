@@ -4,11 +4,21 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: leanprover/lean-action@v1
         with:
           use-github-cache: "false"
+          test: "true"
       - run: python3 -m unittest discover -v
       - run: lake exe lake-compat 4.36.0 --demo --verify
+      - name: Install and run the native wheel
+        run: |
+          python3 -m venv "$RUNNER_TEMP/wheel-env"
+          "$RUNNER_TEMP/wheel-env/bin/python" -m pip install .
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-env/bin/lake-compat" 4.36.0 --demo --json
