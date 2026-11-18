@@ -2,7 +2,16 @@
 
 Find the dependency that needs attention before upgrading a Lean 4 project. Given a target toolchain, `lake-compat` traces conflicting pins back to the package that requested them. It can look up alternative revisions and build your project's Lake targets with them. Use `--json` for the full package inventory and dependency paths.
 
-## Build and run
+## Install and run
+
+Download the archive for your platform and `SHA256SUMS` from the same [GitHub release](https://github.com/Cameron-Lyons/lake-compat/releases). Verify the archive with `sha256sum -c SHA256SUMS --ignore-missing` on Linux. On macOS, run `shasum -a 256 <archive>` and compare its digest with the matching entry in `SHA256SUMS`. Extract it with `tar -xzf <archive>`, then run the bundled demo.
+
+```sh
+./lake-compat --version
+./lake-compat 4.36.0 --demo
+```
+
+The native release replaces the `v0.1.0` Python wheel and `.pyz`. Use the standalone executable directly in scripts that used `python3 lake-compat.pyz`. Consumers of `--json` will see the new `schema_version` field.
 
 Build the native executable with the toolchain in `lean-toolchain` (Lean 4.36.0). The executable embeds its demo and can run outside the source checkout.
 
@@ -14,12 +23,13 @@ lake exe lake-compat 4.36.0 --demo
 
 The demo reports `upgradeDemo -> greeting`. The dependency declares Lean 4.35.0, one release behind the target. Copy the executable to a directory on your path to run `lake-compat` directly. Metadata scans work offline. Git is used to read locked commits. A standalone executable built on a compatible platform can scan projects using other Lean toolchains.
 
-To use the command as a Lake dependency in a project on the supported build toolchain, add the following to its `lakefile.toml`. Pin `rev` to the commit you want to use.
+To use the command as a Lake dependency in a project on the supported build toolchain, add the following to its `lakefile.toml`. Set `rev` to the native release tag or commit you want to use.
 
 ```toml
 [[require]]
 name = "lake-compat"
 git = "https://github.com/Cameron-Lyons/lake-compat"
+rev = "<native-release-tag-or-commit>"
 ```
 
 From the project's root, run `lake --keep-toolchain update lake-compat`, then `lake exe lake-compat 4.36.0`. Without `--project`, the command uses the current directory.
@@ -63,7 +73,34 @@ The source snapshot limit is 1 GiB. The `lake build` step has a ten-minute timeo
 | 1 | The build failed, or `--strict` found metadata issues in the original lock. |
 | 2 | Input was invalid, the build toolchain was unavailable, or verification was inconclusive. |
 
-Package metadata findings always describe the project's original lock. A trial build has its own result. Project-specific tests can be run separately after adopting the pins.
+Package metadata findings always describe the project's original lock. A passing trial can therefore exit 1 under `--strict`. An unavailable or inconclusive trial exits 2 even when `--strict` also finds issues. Suggestions alone leave the exit code unchanged. Project-specific tests can be run separately after adopting the pins.
+
+## JSON contract
+
+`--json` emits one object on stdout with `schema_version: 1`. A scan includes `project`, `target`, `root_toolchain`, `packages`, and `findings`. Input and scan errors return an `error` string and exit 2. Suggestions appear when requested. Trials include `trial_revisions` and `verification`, whose status is `passed`, `failed`, `unavailable`, or `inconclusive`. A passed trial includes `checked_revisions`, even when the set of Git pins is empty. [JSON Schema](schema/report-v1.json)
+
+Use finding `kind` for automation. The current kinds are:
+
+| Findings | Kinds |
+| --- | --- |
+| Toolchain | `toolchain_mismatch`, `unknown_toolchain` |
+| Conflicting or incomplete lock | `revision_conflict`, `source_conflict`, `unlocked_dependency`, `active_overrides` |
+| Checkout | `missing_checkout`, `checkout_revision_mismatch`, `unknown_checkout_revision`, `unknown_package_directory` |
+| Package manifest or ancestry | `missing_manifest`, `invalid_manifest`, `unknown_path`, `unknown_path_source` |
+
+The command-line flags, documented exit codes, and JSON field types are the 1.x compatibility contract. Consumers should tolerate extra JSON fields and new finding kinds. Human-readable messages can change. The Lean modules are implementation APIs and may change independently of the CLI contract.
+
+## Supported environments
+
+| Operation | Support for the native release |
+| --- | --- |
+| Install a standalone archive | Linux x86-64 on Ubuntu 24.04 and Apple silicon on macOS 15 |
+| Build from source or use as a Lake dependency | Lean 4.36.0 |
+| Scan metadata | Lake manifest versions 5–7 and 1.x. Lean is unnecessary at runtime. Git and a local checkout of locked commits are needed for Git metadata. |
+| Look up suggestions | `curl` and Reservoir access. Available toolchains and revisions depend on the index. |
+| Verify a build | Linux or macOS with Git and the target toolchain installed in elan. The release checks exercise Lean 4.34.1 and 4.36.0. |
+
+Windows builds and Intel macOS binaries are outside the supported release matrix.
 
 ## Standalone distribution
 
@@ -81,10 +118,17 @@ CI runs the Lean tests on Ubuntu and macOS. The suite exercises the CLI, Git che
 
 ```sh
 actionlint
+shellcheck scripts/release-compat.sh
 lake --wfail lint --linters=.extra LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main PackageRelease
 lake --wfail build LakeCompat lake-compat package-release
 lake --wfail test
 lake exe lake-compat "$(cat lean-toolchain)" --demo --verify
 ```
+
+## Release process
+
+Set the same version in `VERSION` and `lakefile.toml`, then run the **Native release** workflow manually to test packaging without publishing. It builds both archives, runs them on separate runners without a Lean installation step, and uses the Linux archive to check a pinned RealWorld conflict, a live Reservoir lookup, a Git-backed upgrade trial, and downstream installation from Git.
+
+The same workflow runs for a matching `v<VERSION>` tag and publishes the tested archives and checksums after all gates pass. A tag such as `v1.0.0-rc.1` creates a GitHub prerelease. Promote to 1.0.0 after the release candidate passes the checks and any issues are resolved.
 
 Lake-compat is distributed under the Apache License, Version 2.0. [License](LICENSE)

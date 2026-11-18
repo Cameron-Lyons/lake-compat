@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lake-compat CLI report v1",
+  "type": "object",
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": 1 }
+  },
+  "oneOf": [
+    { "required": ["error"], "properties": { "error": { "type": "string" } } },
+    {
+      "required": ["project", "target", "root_toolchain", "packages", "findings"],
+      "properties": {
+        "project": { "type": "string" },
+        "target": { "type": "string" },
+        "root_toolchain": { "$ref": "#/$defs/nullableString" },
+        "project_source": { "const": "bundled_demo" },
+        "packages": { "type": "array", "items": { "$ref": "#/$defs/package" } },
+        "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+        "suggestions": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/suggestion" }
+        },
+        "auto_selected": { "const": true },
+        "build_targets": { "$ref": "#/$defs/strings" },
+        "trial_revisions": { "$ref": "#/$defs/revisions" },
+        "verification": { "$ref": "#/$defs/verification" }
+      },
+      "dependentRequired": {
+        "verification": ["trial_revisions"],
+        "trial_revisions": ["verification"],
+        "build_targets": ["verification"],
+        "auto_selected": ["suggestions", "verification"]
+      }
+    }
+  ],
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "nullableBoolean": { "type": ["boolean", "null"] },
+    "strings": { "type": "array", "items": { "type": "string" } },
+    "revisions": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "package": {
+      "type": "object",
+      "required": ["name", "type", "toolchain", "toolchain_source", "revision", "url",
+        "scope", "sub_dir", "input_rev", "checkout", "direct", "fixed_toolchain", "path", "path_known"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "enum": ["git", "path"] },
+        "toolchain": { "$ref": "#/$defs/nullableString" },
+        "toolchain_source": { "enum": ["package", "repository", "ancestor", "workspace", null] },
+        "revision": { "$ref": "#/$defs/nullableString" },
+        "url": { "$ref": "#/$defs/nullableString" },
+        "scope": { "type": "string" },
+        "sub_dir": { "$ref": "#/$defs/nullableString" },
+        "input_rev": { "$ref": "#/$defs/nullableString" },
+        "checkout": { "type": "string" },
+        "direct": { "type": "boolean" },
+        "fixed_toolchain": { "$ref": "#/$defs/nullableBoolean" },
+        "path": { "$ref": "#/$defs/strings" },
+        "path_known": { "type": "boolean" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["kind", "package", "path", "message"],
+      "properties": {
+        "kind": { "type": "string" },
+        "package": { "type": "string" },
+        "path": { "$ref": "#/$defs/strings" },
+        "message": { "type": "string" },
+        "parent": { "type": "string" },
+        "requested_revision": { "$ref": "#/$defs/nullableString" },
+        "selected_revision": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "suggestion": {
+      "type": "object",
+      "required": ["status", "message", "candidates"],
+      "properties": {
+        "status": { "enum": ["found", "no_match", "unsupported", "unavailable"] },
+        "message": { "type": "string" },
+        "candidates": { "type": "array", "items": { "$ref": "#/$defs/candidate" } },
+        "unavailable_history": { "enum": ["builds", "versions"] }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["revision", "tag", "toolchain", "evidence", "required_update", "tested", "build_url"],
+      "properties": {
+        "revision": { "type": "string" },
+        "tag": { "$ref": "#/$defs/nullableString" },
+        "toolchain": { "type": "string" },
+        "evidence": { "enum": ["built", "declared"] },
+        "required_update": { "$ref": "#/$defs/nullableBoolean" },
+        "tested": { "$ref": "#/$defs/nullableBoolean" },
+        "build_url": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["status", "message"],
+      "properties": {
+        "status": { "enum": ["passed", "failed", "unavailable", "inconclusive"] },
+        "message": { "type": "string" },
+        "output": { "type": "string" },
+        "lake_version": { "type": "string" },
+        "checked_revisions": { "$ref": "#/$defs/revisions" }
+      },
+      "if": { "properties": { "status": { "const": "passed" } } },
+      "then": { "required": ["output", "lake_version", "checked_revisions"] }
+    }
+  }
+}

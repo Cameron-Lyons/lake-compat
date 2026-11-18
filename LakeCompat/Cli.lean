@@ -10,6 +10,11 @@ import Std.Data.HashSet
 namespace LakeCompat
 open Lean System
 
+private def version : String := (include_str "../VERSION").trimAscii.copy
+
+private def printJson (report : Json) : IO Unit :=
+  IO.println (report.setObjVal! "schema_version" (toJson (1 : Nat))).compress
+
 private def regularFile (path : FilePath) : IO Bool := do
   try return (← path.metadata).type == .file
   catch e => if e matches .noFileOrDirectory .. then return false else throw e
@@ -87,11 +92,14 @@ private def scan (opts : Options) (project : FilePath) : IO Json := do
   return if opts.demo then displayDemo project report else report
 
 private def reportError (json : Bool) (message : String) : IO UInt32 := do
-  if json then IO.println (Json.mkObj [("error", .str message)]).compress
+  if json then printJson (Json.mkObj [("error", .str message)])
   else IO.eprintln s!"lake-compat: {message}"
   return 2
 
 def run (args : List String) : IO UInt32 := do
+  if args == ["--version"] then
+    IO.println s!"lake-compat {version}"
+    return 0
   let flags := args.takeWhile (· != "--")
   if flags.any (fun arg => arg == "--help" || arg == "-h") then
     IO.println usage
@@ -101,7 +109,7 @@ def run (args : List String) : IO UInt32 := do
     | .error message => return ← reportError (flags.contains "--json") message
   try
     let report ← if opts.demo then withDemo (scan opts) else scan opts (opts.project.getD ".")
-    IO.println (if opts.json then report.compress else Report.render report)
+    if opts.json then printJson report else IO.println (Report.render report)
     return Report.exitCode report opts.strict
   catch e => reportError opts.json e.toString
 

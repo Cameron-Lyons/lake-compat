@@ -34,7 +34,9 @@ private def expectCode (out : IO.Process.Output) (code : UInt32) : IO Unit :=
 private def jsonResult (out : IO.Process.Output) (code : UInt32) : IO Json := do
   expectCode out code
   check out.stderr.isEmpty out.stderr
-  IO.ofExcept (Json.parse out.stdout)
+  let report ← IO.ofExcept (Json.parse out.stdout)
+  check (report.getObjValD "schema_version" == toJson (1 : Nat)) report.compress
+  return report
 
 private def expectError (project : FilePath) (args : Array String) (detail : String) : IO String := do
   let report ← jsonResult (← invoke project (#["--json"] ++ args)) 2
@@ -136,15 +138,19 @@ private def trials : IO Unit := withProject fun project => do
   IO.FS.writeFile (project / "lakefile.toml") ""
   for (extra, rev) in [(#[], newRev), (#["--try-revision", "lib=" ++ oldRev], oldRev)] do
     let r ← jsonResult (← invoke project (#["--try-suggested", "--json"] ++ extra) (env "candidates")) 1
-    let output := LakeCompat.Report.string (r.getObjValD "verification") "output"
+    let verification := r.getObjValD "verification"
     check (r.getObjValD "auto_selected" == true && r.getObjValD "trial_revisions" == Json.mkObj [("lib", rev)] &&
-      output.contains rev) r.compress
+      verification.getObjValD "status" == "failed" &&
+      (LakeCompat.Report.string verification "output").contains rev) r.compress
   let quoted ← jsonResult (← invoke project #["--try-revision", "«lib»=" ++ oldRev, "--json"] (env "candidates")) 1
   check (quoted.getObjValD "trial_revisions" == Json.mkObj [("lib", oldRev)]) quoted.compress
   let unavailable ← invoke project #["--try-suggested"] (env "unavailable")
   expectCode unavailable 2
   check (unavailable.stdout.contains "trial uses the current lock" && unavailable.stdout.contains "Build unavailable")
     unavailable.stdout
+  let strict ← jsonResult (← invoke project #["--verify", "--strict", "--json"] (env "unavailable")) 2
+  check (!(LakeCompat.Report.rows strict "findings").isEmpty &&
+    (strict.getObjValD "verification").getObjValD "status" == "unavailable") strict.compress
   let timed ← jsonResult (← invoke project #["--verify", "--json", "--build-timeout=1"] (env "timeout")) 2
   let failed := timed.getObjValD "verification"
   check (failed.getObjValD "status" == "inconclusive" && (LakeCompat.Report.string failed "message").contains "1-second" &&
@@ -179,9 +185,17 @@ private def namedTargets : IO Unit := withTempDir fun project => do
   let passed ← jsonResult (← cli (args.push "--json")) 0
   check (passed.getObjValD "build_targets" == toJson ["CoreLib", "@dep/+Extra:olean"] &&
     (passed.getObjValD "verification").getObjValD "status" == "passed") passed.compress
+  IO.FS.writeFile (dep / "lean-toolchain") "leanprover/lean4:v4.34.1\n"
+  let strict ← jsonResult (← cli (args ++ #["--strict", "--json"])) 1
+  check ((strict.getObjValD "verification").getObjValD "status" == "passed" &&
+    (LakeCompat.Report.rows strict "findings").any (fun f => f.getObjValD "kind" == "toolchain_mismatch")) strict.compress
   check (!(← (project / ".lake").pathExists)) "named-target build wrote to the source project"
 
 def run : IO Unit := do
+  let version := (include_str "../VERSION").trimAscii.copy
+  let output ← cli #["--version"] #[("PATH", some "")]
+  expectCode output 0
+  check (output.stdout == s!"lake-compat {version}\n" && output.stderr.isEmpty) output.stdout
   scan
   inputErrors
   suggestions

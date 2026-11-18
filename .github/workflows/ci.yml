@@ -4,8 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
-    tags: ['v*']
   merge_group:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -28,6 +28,8 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
+      - name: Lint the release compatibility script
+        run: shellcheck scripts/release-compat.sh
 
   test:
     name: Test (${{ matrix.os }})
@@ -54,6 +56,10 @@ jobs:
         run: lake --wfail build LakeCompat lake-compat package-release
       - name: Run unit, integration, and distribution tests
         run: lake --wfail test
+      - name: Check the CLI and Lake package versions
+        run: |
+          test "$(lake exe lake-compat --version)" = "lake-compat $(cat VERSION)"
+          test "$(awk -F '"' '/^version = / {print $2}' lakefile.toml)" = "$(cat VERSION)"
       - name: Verify the demo with the installed toolchain
         run: lake exe lake-compat "$(cat lean-toolchain)" --demo --verify
 
