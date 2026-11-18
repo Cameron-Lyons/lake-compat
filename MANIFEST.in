@@ -1,4 +1,4 @@
-include tools/build_zipapp.py
+include requirements-dev.txt tools/build_zipapp.py tools/check_wheel.py
 include LakeCompat.lean LakeCompatMain.lean lakefile.toml lake-manifest.json lean-toolchain
 recursive-include LakeCompat *.lean
 recursive-include LeanTests *.lean

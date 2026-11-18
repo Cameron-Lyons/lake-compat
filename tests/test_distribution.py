@@ -6,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from tests.native import BINARY, ROOT, build_cli
@@ -13,6 +14,37 @@ from tools.build_zipapp import build_zipapp
 
 
 class StandaloneDistribution(unittest.TestCase):
+    def test_source_launcher_reports_missing_build_tool_as_json(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "lake_compat", "4.36.0", "--demo", "--json"],
+            cwd=ROOT,
+            env={**os.environ, "PATH": ""},
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("lake", json.loads(result.stdout)["error"])
+        self.assertEqual(result.stderr, b"")
+
+    def test_archive_startup_error_treats_json_after_separator_as_positional(self):
+        with TemporaryDirectory() as temp:
+            download = Path(temp)
+            binary = download / "native"
+            binary.write_bytes(b"unusable executable\n")
+            archive = download / "lake-compat.pyz"
+            with patch("tools.build_zipapp.build_native", return_value=binary):
+                build_zipapp(ROOT, archive)
+            result = subprocess.run(
+                [sys.executable, "-I", archive, "--", "--json"],
+                cwd=download,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"Could not start lake-compat", result.stderr)
+            self.assertNotIn(b"Traceback", result.stderr)
+            self.assertEqual(result.stdout, b"")
+
     def test_downloaded_archive_can_scan_demo_in_an_empty_directory(self):
         with TemporaryDirectory() as temp:
             download = Path(temp)
