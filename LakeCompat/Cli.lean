@@ -95,12 +95,13 @@ private def reportError (json : Bool) (message : String) : IO UInt32 := do
   return 2
 
 def run (args : List String) : IO UInt32 := do
-  if (args.takeWhile (· != "--")).any (fun arg => arg == "--help" || arg == "-h") then
+  let flags := args.takeWhile (· != "--")
+  if flags.any (fun arg => arg == "--help" || arg == "-h") then
     IO.println usage
     return 0
   let opts ← match parseOptions args with
     | .ok opts => pure opts
-    | .error message => return ← reportError (args.contains "--json") message
+    | .error message => return ← reportError (flags.contains "--json") message
   try
     let report ← if opts.demo then withDemo (scan opts) else scan opts (opts.project.getD ".")
     IO.println (if opts.json then report.compress else Report.render report)

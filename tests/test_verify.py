@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,9 +86,17 @@ class VerifyBuildTests(unittest.TestCase):
         cache = self.project / ".lake/build"
         cache.mkdir(parents=True)
         (cache / "stale.olean").touch()
+        for index in range(24):
+            directory = self.project / f"module-{index}"
+            directory.mkdir()
+            script = directory / "build.sh"
+            script.write_text(f"echo {index}\n")
+            script.chmod(0o755)
         self.write_elan(
-            "pathlib.Path('Main.lean').write_text('-- changed during build')\nprint('done')"
-        )
+            "for index in range(24):\n"
+            "    script = pathlib.Path(f'module-{index}/build.sh')\n"
+            "    assert script.read_text() == f'echo {index}\\n' and os.access(script, os.X_OK)\n"
+            "pathlib.Path('Main.lean').write_text('-- changed during build')\nprint('done')")
         original = self.lock.read_bytes()
         report = verify_build(self.project, self.target)
         self.assertEqual(report["status"], "passed", report)
@@ -101,6 +110,19 @@ class VerifyBuildTests(unittest.TestCase):
         report = verify_build(self.project, self.target)
         self.assertEqual(report["status"], "inconclusive")
         self.assertIn("changed", report["message"])
+
+    def test_build_with_implicit_empty_packages(self):
+        self.elan.unlink()
+        target = (REPO / "lean-toolchain").read_text().strip()
+        if not shutil.which("elan") or subprocess.run(
+                ["elan", "run", target, "lake", "--version"], capture_output=True).returncode:
+            self.skipTest("requires the project toolchain installed in elan")
+        self.lock.write_text(json.dumps({"name": "app", "version": "1.1.0"}))
+        (self.project / "lakefile.toml").write_text(
+            'name = "app"\ndefaultTargets = ["Main"]\n\n[[lean_lib]]\nname = "Main"\n')
+        result = verify_build(self.project, target)
+        self.assertEqual(result["status"], "passed", result)
+        self.assertEqual(result["checked_revisions"], {})
 
     def test_build_failure_includes_only_bounded_tail(self):
         self.write_elan("print('a' * 24000 + ' ERROR at Main.lean:3')\nsys.exit(2)")
@@ -222,21 +244,27 @@ class VerifyBuildTests(unittest.TestCase):
         self.assertEqual(result["status"], "inconclusive")
         self.assertIn("cycle", result["message"])
 
-    def test_cleanup_unlinks_build_created_links(self):
+    def test_cleanup_handles_build_created_links_and_read_only_directories(self):
         temp_path = self.root / "trial-path"
         external = self.root / "keep"
         external.mkdir()
         marker = external / "contents"
         marker.write_text("keep")
+        original_modes = (external.stat().st_mode, marker.stat().st_mode)
         self.write_elan(
             f"pathlib.Path({str(temp_path)!r}).write_text(str(pathlib.Path.cwd()))\n"
             "pathlib.Path('dangling').symlink_to('missing')\n"
-            f"pathlib.Path('external-link').symlink_to({str(external)!r})"
-        )
+            "directory = pathlib.Path('generated/nested')\n"
+            "directory.mkdir(parents=True)\n"
+            f"os.link({str(marker)!r}, directory / 'hard-link')\n"
+            f"(directory / 'external-link').symlink_to({str(external)!r})\n"
+            "directory.chmod(0o500)\n"
+            "directory.parent.chmod(0o500)")
         result = verify_build(self.project, self.target)
         self.assertEqual(result["status"], "passed", result)
-        self.assertFalse(Path(temp_path.read_text()).exists())
+        self.assertFalse(Path(temp_path.read_text()).parent.exists())
         self.assertEqual(marker.read_text(), "keep")
+        self.assertEqual((external.stat().st_mode, marker.stat().st_mode), original_modes)
 
     def test_timeout(self):
         self.write_elan(

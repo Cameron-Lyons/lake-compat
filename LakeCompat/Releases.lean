@@ -71,17 +71,15 @@ private def encode (s : String) : String :=
 private def stringField (row : Json) (name : String) : String :=
   ((row.getObjValD name).getStr?).toOption.getD ""
 
--- Reservoir uses POSIX paths regardless of the client's operating system.
-private def directory (value : String) : Bool × List String :=
-  (value.startsWith "/", (value.splitOn "/").filter (fun p => !p.isEmpty && p != "."))
-
 private def matchesSource (sources : Array Json) (repo subDir : String) : Bool :=
+  let repo := repo.toLower
+  let dir := Source.directoryKey subDir
   sources.any fun source => Id.run do
     if stringField source "host" != "github" then return false
-    if (stringField source "fullName").toLower != repo.toLower then return false
+    if (stringField source "fullName").toLower != repo then return false
     match source.getObjValD "subDir" with
-    | .null => return directory "." == directory subDir
-    | .str path => return directory path == directory subDir
+    | .null => return dir == (false, [])
+    | .str path => return Source.directoryKey path == dir
     | _ => return false
 
 private def records (response : Json) : EIO RegistryError (Array Json) := do
@@ -115,33 +113,46 @@ private def revision? (row : Json) : Option String := do
 private def optionalField [FromJson α] (row : Json) (key : String) : Except RegistryError (Option α) :=
   (fromJson? (row.getObjValD key)).mapError fun _ => .invalid
 
-private def indexEvidence (versions builds : Array Json) (target : String) : Except RegistryError Index := do
+attribute [local instance] lexOrd
+
+private def indexVersions (versions : Array Json) (target : String) : Except RegistryError Index := do
   let mut index : Index := {}
-  for row in builds do
-    if stringField row "toolchain" != target then continue
-    let some rev := revision? row | continue
-    let runAt := (← optionalField row "runAt").getD ""
-    let evidence := index.getD rev {}
-    -- A later failed run disqualifies even a revision which declares the target.
-    if evidence.build.any (·.runAt >= runAt) then continue
-    let tested : Option Bool ← optionalField row "tested"
-    let build := {
-      runAt, tested
-      passed := row.getObjValD "built" == .bool true && tested != some false
-      requiredUpdate := ← optionalField row "requiredUpdate"
-      url := ← optionalField row "url"
-    }
-    index := index.insert rev { evidence with build := some build }
   for row in versions do
     let some rev := revision? row | continue
     let evidence := index.getD rev {}
     let date := (← optionalField row "date").getD ""
     let label := stringField row "tag"
-    let tag := if printable label && !evidence.tag.any (·.1 >= date) then some (date, label) else evidence.tag
+    let tag := if printable label && compare evidence.tag (some (date, label)) == .lt
+      then some (date, label) else evidence.tag
     index := index.insert rev { evidence with
       declared := evidence.declared || stringField row "toolchain" == target
       date := max evidence.date date
       tag }
+  return index
+
+/-- A failure wins a tie in run times. Among equally recent successes, keep the
+    strongest build evidence and use the URL as a stable final tie breaker. -/
+private def Build.priority (b : Build) :=
+  (b.runAt, !b.passed, b.requiredUpdate == some false, b.requiredUpdate.isNone,
+    b.tested == some true, b.url)
+
+private def indexBuilds (initial : Index) (builds : Array Json) (target : String) : Except RegistryError Index := do
+  let mut index := initial
+  for row in builds do
+    if stringField row "toolchain" != target then continue
+    let some rev := revision? row | continue
+    let .bool built := row.getObjValD "built" | throw .invalid
+    let tested : Option Bool ← optionalField row "tested"
+    let build : Build := {
+      runAt := (← optionalField row "runAt").getD ""
+      tested
+      passed := built && tested != some false
+      requiredUpdate := ← optionalField row "requiredUpdate"
+      url := ← optionalField row "url"
+    }
+    let evidence := index.getD rev {}
+    if evidence.build.any (fun prev => compare prev.priority build.priority != .lt) then continue
+    index := index.insert rev { evidence with build := some build }
   return index
 
 private def priority (rev : String) (e : Evidence) :=
@@ -158,8 +169,6 @@ private def candidate (target rev : String) (e : Evidence) : Json :=
 
 private def result (status message : String) (candidates : List Json := []) : Json :=
   Json.mkObj [("status", status), ("message", message), ("candidates", .arr candidates.toArray)]
-
-attribute [local instance] lexOrd
 
 private def ranked (index : Index) (target : String) : Json := Id.run do
   let mut best := []
@@ -178,14 +187,18 @@ private def lookup (fetch : Fetch) (endpoint target repo : String) (package subD
     EIO RegistryError Json := do
   let metadata ← fetch endpoint
   unless metadata matches .obj _ do throw .invalid
-  if package.any (fun name => name != stringField metadata "name") then
-    return result "unsupported" "Registry package name differs from the requested name."
+  if let some expected := package then
+    let .str name := metadata.getObjValD "name" | throw .invalid
+    if name.isEmpty then throw .invalid
+    if name != expected then
+      return result "unsupported" "Registry package name differs from the requested name."
   let .arr sources := metadata.getObjValD "sources" | throw .invalid
   unless matchesSource sources repo (subDir.getD ".") do
     return result "unsupported" "Registry source differs in repository or package directory."
   let versions ← records (← fetch (endpoint ++ "/versions"))
+  let index ← ofExcept (indexVersions versions target)
   let builds ← records (← fetch (endpoint ++ "/builds"))
-  let index ← ofExcept (indexEvidence versions builds target)
+  let index ← ofExcept (indexBuilds index builds target)
   return ranked index target
 
 /-- Look up one Git package and rank revisions with evidence for the exact target toolchain. -/

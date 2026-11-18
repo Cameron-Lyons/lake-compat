@@ -26,7 +26,7 @@ From the project's root, run `lake --keep-toolchain update lake-compat`, then `l
 
 ## Read a scan
 
-The scan reads the project's `lake-manifest.json`, including legacy versions 5–7 and current 1.x manifests. For a Git dependency, it checks the checkout's revision and reads its toolchain and manifest from the locked commit. Local path dependencies use the files in your working tree. Missing checkouts and unverifiable Git revisions appear as findings, including in `--strict` mode. On a fresh checkout, an ordinary `lake build` on the project's current toolchain materializes its dependencies.
+The scan reads the project's `lake-manifest.json`, including legacy versions 5–7 and current 1.x manifests. For a Git dependency, it checks the checkout's revision and reads its toolchain and manifest from the locked commit. Local path dependencies use the working tree until their paths enter a locked Git checkout. Scans with Git dependencies use `readlink` on POSIX or Windows PowerShell to follow workspace symlinks in those paths. Missing checkouts and unverifiable Git revisions appear as findings, including in `--strict` mode. On a fresh checkout, an ordinary `lake build` on the project's current toolchain materializes its dependencies.
 
 For example, in the Lean RealWorld application, `realworld -> jose -> json` identifies the dependency that selected a different JSON revision. The diagnostic includes both full commits. A mismatch is a reason to test the combination. The application may already build with that override. [RealWorld dependency configuration](https://github.com/saviorand/lean-realworld-example-app/tree/483d47e1d3c797098ac55cbf23a95072f7a6b6e5)
 

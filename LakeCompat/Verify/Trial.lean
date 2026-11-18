@@ -50,11 +50,11 @@ def loadTrial (project : FilePath) (revisions : Pins) : IO Trial := do
     throw <| IO.userError "Build verification currently supports the standard .lake/packages layout."
   let mut pins : Pins := ∅
   let mut paths := #[]
-  let mut entries := #[]
-  for original in ← IO.ofExcept (raw.getObjValD "packages").getArr? do
-    let (kind, fields, tagged) ← IO.ofExcept <| unpackEntry original
+  -- Lock.ofJson validated the array if present. Lake defaults an omitted array to empty.
+  let mut entries := (raw.getObjValD "packages").getArr?.toOption.getD #[]
+  for i in [:entries.size] do
+    let (kind, fields, tagged) ← IO.ofExcept <| unpackEntry entries[i]!
     let name ← IO.ofExcept <| (fields.getObjValD "name").getStr? >>= packageName
-    let mut entry := original
     for key in [if tagged then "subDir?" else "subDir", "configFile", "manifestFile"] do
       let value := fields.getObjValD key
       unless value == .null do discard <| IO.ofExcept <| relative value (name ++ "." ++ key)
@@ -68,12 +68,12 @@ def loadTrial (project : FilePath) (revisions : Pins) : IO Trial := do
       if revisions.contains name then
         let pinned := fields.setObjVal! "rev" (.str revision)
         let pinned := pinned.setObjVal! (if tagged then "inputRev?" else "inputRev") (.str revision)
-        entry := if tagged then Json.mkObj [(kind, pinned)] else pinned
-    entries := entries.push entry
+        entries := entries.set! i (if tagged then Json.mkObj [(kind, pinned)] else pinned)
   let unknown := revisions.keys.filter (!pins.contains ·)
   unless unknown.isEmpty do
     throw <| IO.userError s!"Trial revisions must name locked Git packages: {String.intercalate ", " unknown}."
-  return {manifest := raw.setObjVal! "packages" (.arr entries), pins, paths}
+  let manifest := if revisions.isEmpty then raw else raw.setObjVal! "packages" (.arr entries)
+  return {manifest, pins, paths}
 
 def Trial.checkLocalPaths (trial : Trial) (root : FilePath) (materialized : Bool) : IO Unit := do
   for (name, path) in trial.paths do

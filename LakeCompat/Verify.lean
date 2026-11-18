@@ -75,6 +75,20 @@ private def verifyTrial (parent project : FilePath) (target : String) (revisions
   return report "passed" s!"Default targets built on {target} with the trial pins."
     ((← detail.get).setObjVal! "checked_revisions" checked)
 
+/-- Builds can leave read-only directories. Restore owner access only on directories in the
+temporary tree, so hard-linked files and symlink targets keep their permissions. -/
+private partial def removeTrialTree (path : FilePath) (repairPermissions := false) : IO Unit := do
+  let some info ← metadata? path | return
+  unless info.type == .dir do return ← IO.FS.removeFile path
+  unless repairPermissions do
+    try return ← IO.FS.removeDirAll path catch
+      | .permissionDenied .. => pure ()
+      | e => throw e
+  IO.setAccessRights path { user := { read := true, write := true, execution := true } }
+  for entry in ← path.readDir do
+    removeTrialTree entry.path true
+  IO.FS.removeDir path
+
 end Verify
 
 /-- Verify the default build on an installed Elan toolchain using an isolated working-source copy. -/
@@ -93,8 +107,11 @@ def verifyBuild (project : FilePath) (target : String) (revisions : Array (Strin
       if let some old := pins[name]? then
         unless old == revision.toLower do throw <| IO.userError s!"Two different trial revisions for {name}."
       pins := pins.insert name revision.toLower
-    IO.FS.withTempDir fun temp => do
+    let temp ← IO.FS.createTempDir
+    try
       Verify.verifyTrial (← IO.FS.realPath temp) source target pins buildTimeoutMs detail
+    finally
+      Verify.removeTrialTree temp
   catch e => return Verify.report "inconclusive" (toString e) (← detail.get)
 
 end LakeCompat
