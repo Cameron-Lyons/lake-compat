@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lake-compat"
+version = "0.1.0"
+description = "Explain and test dependency upgrades in Lean 4 projects"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[project.urls]
+Repository = "https://github.com/Cameron-Lyons/lake-compat"
+Releases = "https://github.com/Cameron-Lyons/lake-compat/releases"
+
+[project.scripts]
+lake-compat = "lake_compat.cli:main"
+
+[tool.setuptools]
+packages = ["lake_compat"]
+
+[tool.setuptools.package-data]
+lake_compat = ["upgrade-demo/*", "upgrade-demo/greeting/*"]

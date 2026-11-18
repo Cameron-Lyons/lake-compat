@@ -1,0 +1,12 @@
+name = "lake-compat"
+version = "0.1.0"
+description = "Explain and test dependency upgrades in Lean 4 projects"
+keywords = ["lake", "dependencies", "toolchain", "upgrades"]
+license = "Apache-2.0"
+defaultTargets = ["lake-compat"]
+testDriver = "«lake-compat»"
+testDriverArgs = ["4.36.0", "--demo"]
+
+[[lean_exe]]
+name = "lake-compat"
+root = "LakeCompatMain"

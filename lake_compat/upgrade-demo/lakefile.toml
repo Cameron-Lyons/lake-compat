@@ -1,0 +1,10 @@
+name = "upgradeDemo"
+defaultTargets = ["upgradeDemo"]
+
+[[require]]
+name = "greeting"
+path = "greeting"
+
+[[lean_exe]]
+name = "upgradeDemo"
+root = "Main"

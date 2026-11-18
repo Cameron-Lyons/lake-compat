@@ -1,0 +1,18 @@
+{
+  "version": "1.2.0",
+  "name": "upgradeDemo",
+  "lakeDir": ".lake",
+  "packagesDir": ".lake/packages",
+  "fixedToolchain": false,
+  "packages": [
+    {
+      "name": "greeting",
+      "scope": "",
+      "type": "path",
+      "dir": "greeting",
+      "inherited": false,
+      "configFile": "lakefile.toml",
+      "manifestFile": "lake-manifest.json"
+    }
+  ]
+}
