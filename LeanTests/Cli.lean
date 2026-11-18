@@ -68,6 +68,8 @@ private def inputErrors : IO Unit := withProject fun project => do
   discard <| expectError project #["--try-revision", "other=" ++ newRev] "other"
   for args in [#["--demo"], #["--try-revision", "lib=main"], #["--unknown"], #["--project="],
       #["--build-timeout"], #["--build-timeout", "0"], #["--build-timeout=0.5"],
+      #["--build-target"], #["--build-target="], #["--build-target=--help"], #["--build-target", "@dep/"],
+      #["--build-target", "CoreLib:olean:extra"],
       #["--try-revision", "lib=" ++ oldRev, "--try-revision", "lib=" ++ newRev]] do
     discard <| expectError project args ""
   let positional ← cli #["4.36.0", "--", "--json"]
@@ -137,6 +139,8 @@ private def trials : IO Unit := withProject fun project => do
     let output := LakeCompat.Report.string (r.getObjValD "verification") "output"
     check (r.getObjValD "auto_selected" == true && r.getObjValD "trial_revisions" == Json.mkObj [("lib", rev)] &&
       output.contains rev) r.compress
+  let quoted ← jsonResult (← invoke project #["--try-revision", "«lib»=" ++ oldRev, "--json"] (env "candidates")) 1
+  check (quoted.getObjValD "trial_revisions" == Json.mkObj [("lib", oldRev)]) quoted.compress
   let unavailable ← invoke project #["--try-suggested"] (env "unavailable")
   expectCode unavailable 2
   check (unavailable.stdout.contains "trial uses the current lock" && unavailable.stdout.contains "Build unavailable")
@@ -151,10 +155,38 @@ private def trials : IO Unit := withProject fun project => do
     verification.getObjValD "status" == "inconclusive" &&
     (LakeCompat.Report.string verification "message").contains "manifest changed") changed.compress
 
+private def namedTargets : IO Unit := withTempDir fun project => do
+  let dep := project / "dep"
+  IO.FS.createDir dep
+  IO.FS.writeFile (project / "lakefile.toml") <|
+    "name = \"app\"\n[[lean_lib]]\nname = \"CoreLib\"\n[[require]]\nname = \"dep\"\npath = \"dep\"\n"
+  IO.FS.writeFile (dep / "lakefile.toml") "name = \"dep\"\n[[lean_lib]]\nname = \"Extra\"\n"
+  writeJson (dep / "lake-manifest.json") (projectLock #[] "dep")
+  let entry := Json.mkObj [("name", "dep"), ("type", "path"), ("dir", "dep"),
+    ("configFile", "lakefile.toml"), ("inherited", false)]
+  writeJson (project / "lake-manifest.json") (projectLock #[entry])
+  let toolchain := (include_str "../lean-toolchain").trimAscii.copy
+  IO.FS.writeFile (project / "lean-toolchain") toolchain
+  let args := #[toolchain, "--project", project.toString, "--build-target=CoreLib", "--build-target", "@dep/+Extra:olean"]
+  let files := [project / "CoreLib.lean", dep / "Extra.lean"]
+  for file in files do IO.FS.writeFile file "example : Nat := 1\n"
+  for file in files do
+    IO.FS.writeFile file "example : Nat := false\n"
+    let failed ← cli args
+    expectCode failed 1
+    check (failed.stdout.contains "CoreLib, @dep/+Extra:olean" && failed.stdout.contains file.fileName.get!) failed.stdout
+    IO.FS.writeFile file "example : Nat := 1\n"
+  let passed ← jsonResult (← cli (args.push "--json")) 0
+  check (passed.getObjValD "build_targets" == toJson ["CoreLib", "@dep/+Extra:olean"] &&
+    (passed.getObjValD "verification").getObjValD "status" == "passed") passed.compress
+  check (!(← (project / ".lake").pathExists)) "named-target build wrote to the source project"
+
 def run : IO Unit := do
   scan
   inputErrors
   suggestions
-  unless Platform.isWindows do trials
+  unless Platform.isWindows do
+    trials
+    namedTargets
 
 end LeanTests.Cli

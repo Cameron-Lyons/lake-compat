@@ -31,6 +31,10 @@ private def outcomes : IO Unit := withProject fun project => do
   expect tail "failed"
   let output := field tail "output"
   check (output.utf8ByteSize ≤ 16 * 1024 && output.contains "ERROR at Main.lean:3") "incorrect log tail"
+  let binary ← trial project "binary-log"
+  expect binary "failed"
+  let output := field binary "output"
+  check (output.utf8ByteSize ≤ LakeCompat.Verify.logLimit && output.endsWith "build failed") "unbounded binary log"
   let diag ← trial project "diagnostic"
   expect diag "failed"
   let output := field diag "output"
@@ -40,6 +44,17 @@ private def outcomes : IO Unit := withProject fun project => do
   expect timed "inconclusive" "timeout"
   check ((field timed "output").contains "compiler still running") timed.compress
 
+private def snapshotNames : IO Unit := withProject fun project => do
+  let copy := project.parent.get! / "copy"
+  for name in [".Git", ".Lake"] do write (project / name / "marker") "source"
+  let folded ← (project / ".git").pathExists
+  if !folded then
+    for name in [".git", ".lake"] do write (project / name / "marker") "cache"
+  LakeCompat.Verify.copySources project copy
+  for name in [".git", ".lake"] do check (!(← (copy / name).pathExists)) s!"copied {name}"
+  for name in [".Git", ".Lake"] do
+    check ((← (copy / name / "marker").pathExists) == !folded) s!"wrong snapshot handling for {name}"
+
 private def localPaths : IO Unit := withProject fun project => do
   let lock := project / "lake-manifest.json"
   for path in [project.parent.get!.toString, "../elsewhere", ".", ".git/objects"] do
@@ -48,6 +63,9 @@ private def localPaths : IO Unit := withProject fun project => do
   IO.FS.createDir (project / "sources")
   writeJson lock ((manifest #[pathEntry "dep" "sources" (copy := true)]).setObjVal! "packagesDir" "sources/vendor")
   expect (← trial project) "inconclusive" "own source directory"
+  if ← (project / "SOURCES").pathExists then
+    writeJson lock ((manifest #[pathEntry "dep" "sources" (copy := true)]).setObjVal! "packagesDir" "SOURCES/new/vendor")
+    expect (← trial project) "inconclusive" "own source directory"
   writeJson lock (manifest #[pathEntry "dep" "../outside"])
   expect (← trial project) "inconclusive" "outside"
   writeJson lock (manifest)
@@ -161,6 +179,7 @@ private def taggedSha256 : IO Unit := withProject fun project => do
 def run : IO Unit := do
   if Platform.isWindows then return
   isolation
+  snapshotNames
   outcomes
   localPaths
   validLinks

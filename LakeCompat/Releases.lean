@@ -1,5 +1,4 @@
-import Lean.Data.Json.FromToJson.Basic
-import Lean.Data.Json.Parser
+import Lake.Util.Reservoir
 import Std.Data.HashMap
 import Std.Http.Data.URI.Encoding
 import LakeCompat.Source
@@ -89,8 +88,14 @@ private def matchesSource (sources : Array Json) (repo subDir : String) : Bool :
     | .str path => return Source.directoryKey path == dir
     | _ => return false
 
+private def payload (fetch : Fetch) (url : String) : EIO RegistryError Json := do
+  match (fromJson? (← fetch url) : Except String (Lake.ReservoirResp Json)) with
+  | .ok (.data value) => return value
+  | .ok (.error status _) => throw (.http status)
+  | .error _ => throw .invalid
+
 private def records (response : Json) : EIO RegistryError (Array Json) := do
-  let .arr rows := response.getObjValD "data" | throw .invalid
+  let .arr rows := response | throw .invalid
   unless rows.all (fun row => row matches .obj _) do throw .invalid
   return rows
 
@@ -194,7 +199,7 @@ private def ranked (index : Index) (target : String) (missing : String := "") : 
 
 private def lookup (fetch : Fetch) (endpoint target repo : String) (package subDir : Option String) :
     EIO RegistryError Json := do
-  let metadata ← fetch endpoint
+  let metadata ← payload fetch endpoint
   unless metadata matches .obj _ do throw .invalid
   if let some expected := package then
     let .str name := metadata.getObjValD "name" | throw .invalid
@@ -205,7 +210,7 @@ private def lookup (fetch : Fetch) (endpoint target repo : String) (package subD
   unless matchesSource sources repo (subDir.getD ".") do
     return result "unsupported" "Registry source differs in repository or package directory."
   -- Both histories describe the source we just verified and can be retrieved independently.
-  let fetchRows := fun suffix => do records (← fetch (endpoint ++ suffix))
+  let fetchRows := fun suffix => do records (← payload fetch (endpoint ++ suffix))
   let buildsTask ← EIO.asTask (fetchRows "/builds") .dedicated
   let versions ← (do ofExcept (indexVersions (← fetchRows "/versions") target)).toBaseIO
   let declarations := versions.toOption.getD {}

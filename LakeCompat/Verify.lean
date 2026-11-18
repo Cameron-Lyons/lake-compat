@@ -1,5 +1,6 @@
 import LakeCompat.Verify.Process
 import LakeCompat.Verify.Trial
+import LakeCompat.Options
 
 open Lean System
 
@@ -17,11 +18,13 @@ private def run (args : Array String) (cwd : FilePath) (env : Environment) (ms :
     throw <| IO.userError s!"Verification exceeded its {limit} command timeout."
   return result
 
-private def confirmGit (packagesDir : FilePath) (pins : Pins) (env : Environment) (detail : IO.Ref Json) : IO Unit := do
+private def confirmGit (root packagesDir : FilePath) (pins : Pins) (env : Environment) (detail : IO.Ref Json) : IO Unit := do
+  if pins.isEmpty then return
+  let some cache ← isolatedDirectory root packagesDir
+    | throw <| IO.userError s!"Lake did not materialize an isolated package directory at {packagesDir}."
   for (name, expected) in pins do
-    let repo := packagesDir / name
-    unless (← (repo / ".git").symlinkMetadata.toBaseIO).toOption.any (·.type == .dir) &&
-        (← IO.FS.realPath repo) == repo do
+    let repo := cache / name
+    unless (← metadata? repo).any (·.type == .dir) && (← metadata? (repo / ".git")).any (·.type == .dir) do
       throw <| IO.userError s!"Lake did not materialize an isolated checkout of {name}."
     let head ← run #["git", "rev-parse", "--verify", "HEAD"] repo env 10000 detail
     if head.exitCode != 0 || head.output != expected then
@@ -66,7 +69,8 @@ private def configuredPackagesDir (project parent : FilePath) (target : String) 
   return ".lake/packages"
 
 private def verifyTrial (parent project : FilePath) (target : String) (revisions : Pins)
-    (buildTimeoutMs : Nat) (detail : IO.Ref Json) (expectedManifest : Option Json) : IO Json := do
+    (buildTimeoutMs : Nat) (detail : IO.Ref Json) (expectedManifest : Option Json)
+    (targetSpecs : Array String) : IO Json := do
   let env ← trialEnvironment target parent
   let lake := #["elan", "run", target, "lake"]
   let version ← run (lake.push "--version") parent env 20000 detail
@@ -81,9 +85,10 @@ private def verifyTrial (parent project : FilePath) (target : String) (revisions
   let lockFile := workspace / manifestName
   writeInput pinFile (target ++ "\n")
   writeInput lockFile (trial.manifest.pretty ++ "\n")
-  let build ← run (lake.push "build") workspace env buildTimeoutMs detail
+  let build ← run (lake.push "build" ++ targetSpecs) workspace env buildTimeoutMs detail
   detail.set <| Json.mkObj [("output", .str build.output), ("lake_version", .str version.output)]
-  let check ← if build.exitCode == 0 then some <$> run (lake.push "check-build") workspace env 30000 detail else pure none
+  let check ← if build.exitCode == 0 && targetSpecs.isEmpty then
+      some <$> run (lake.push "check-build") workspace env 30000 detail else pure none
   if (← IO.ofExcept <| Json.parse (← IO.FS.readFile lockFile)) != trial.manifest ||
       (← IO.FS.readFile pinFile).trimAscii != target.toSlice then
     return report "inconclusive" "The build changed its trial manifest or toolchain." (← detail.get)
@@ -93,16 +98,17 @@ private def verifyTrial (parent project : FilePath) (target : String) (revisions
     return report "failed" s!"lake build exited with code {build.exitCode}.{hint}" (← detail.get)
   if let some result := check then
     if result.exitCode != 0 then
-      let output := (build.output ++ "\n" ++ result.output).toUTF8
-      let tail := String.fromUTF8Lossy (output.extract (output.size - logLimit) output.size)
+      let tail := boundedLogTail (build.output ++ "\n" ++ result.output)
       detail.modify (·.setObjVal! "output" (.str tail.trimAscii.copy))
-      return report "inconclusive" "Lake could not confirm the project has default build targets." (← detail.get)
+      return report "inconclusive"
+        "Lake could not confirm the project has default build targets. Use --build-target NAME to verify a named target." (← detail.get)
   if (← metadata? (workspace / ".lake" / "package-overrides.json")).isSome then
     throw <| IO.userError "The build created package overrides; the trial manifest cannot confirm effective pins."
-  confirmGit (workspace / trial.packagesDir) trial.pins env detail
+  confirmGit workspace trial.packagesDir trial.pins env detail
   trial.checkLocalPaths workspace true
   let checked := Json.mkObj (trial.pins.toList.map fun (name, rev) => (name, .str rev))
-  return report "passed" s!"Default targets built on {target} with the trial pins."
+  let built := if targetSpecs.isEmpty then "Default targets" else String.intercalate ", " targetSpecs.toList
+  return report "passed" s!"{built} built on {target} with the trial pins."
     ((← detail.get).setObjVal! "checked_revisions" checked)
 
 /-- Builds can leave read-only directories. Restore owner access only on directories in the
@@ -123,14 +129,16 @@ end Verify
 
 def defaultBuildTimeoutSeconds : Nat := 600
 
-/-- Verify the default build on an installed Elan toolchain using an isolated working-source copy. -/
+/-- Verify named or default Lake targets on an installed Elan toolchain in an isolated source copy. -/
 def verifyBuild (project : FilePath) (target : String) (revisions : Array (String × String) := #[])
-    (buildTimeoutMs : Nat := defaultBuildTimeoutSeconds * 1000) (expectedManifest : Option Json := none) : IO Json := do
+    (buildTimeoutMs : Nat := defaultBuildTimeoutSeconds * 1000) (expectedManifest : Option Json := none)
+    (buildTargets : Array String := #[]) : IO Json := do
   if Platform.isWindows then return Verify.report "unavailable" "Build verification requires a POSIX host."
   if target.isEmpty || target.startsWith "-" || target.any Char.isWhitespace || target.contains (Char.ofNat 0) then
     return Verify.report "inconclusive" "Invalid elan toolchain name."
   let detail ← IO.mkRef (Json.mkObj [])
   try
+    let specs ← IO.ofExcept (buildTargets.mapM buildTargetSpec)
     let source ← IO.FS.realPath project
     if (← Verify.metadata? (source / ".lake" / "package-overrides.json")).isSome then
       throw <| IO.userError "This workspace has package overrides; its root manifest alone cannot reproduce them."
@@ -141,7 +149,7 @@ def verifyBuild (project : FilePath) (target : String) (revisions : Array (Strin
       pins := pins.insert name revision.toLower
     let temp ← IO.FS.createTempDir
     try
-      Verify.verifyTrial (← IO.FS.realPath temp) source target pins buildTimeoutMs detail expectedManifest
+      Verify.verifyTrial (← IO.FS.realPath temp) source target pins buildTimeoutMs detail expectedManifest specs
     finally
       Verify.removeTrialTree temp
   catch e => return Verify.report "inconclusive" (toString e) (← detail.get)

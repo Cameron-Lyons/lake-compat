@@ -27,14 +27,16 @@ globs = ["LeanTests.+"]
 [[lean_exe]]
 name = "lake-compat"
 root = "LakeCompatMain"
-# The CLI reads metadata and runs Lake in a child process. It never elaborates Lean.
+# These executables run Lake in a child process and need no Lean elaborator.
 moreLinkArgs = ["-linitialize_minimal"]
 
 [[lean_exe]]
 name = "lake-compat-tests"
 root = "LeanTests.Main"
 needs = ["lake-compat", "package-release"]
+moreLinkArgs = ["-linitialize_minimal"]
 
 [[lean_exe]]
 name = "package-release"
 root = "PackageRelease"
+moreLinkArgs = ["-linitialize_minimal"]
