@@ -1,5 +1,5 @@
 name = "lake-compat"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 description = "Explain and test dependency upgrades in Lean 4 projects"
 keywords = ["lake", "dependencies", "toolchain", "upgrades"]
 license = "Apache-2.0"
@@ -10,6 +10,11 @@ testDriver = "«lake-compat-tests»"
 name = "releaseLicense"
 path = "LICENSE"
 
+[[input_file]]
+name = "releaseVersion"
+path = "VERSION"
+text = true
+
 [[input_dir]]
 name = "demoSources"
 path = "examples/upgrade-demo"
@@ -18,7 +23,7 @@ filter = { fileName = ["Main.lean", "Greeting.lean", "lakefile.toml", "lake-mani
 
 [[lean_lib]]
 name = "LakeCompat"
-needs = ["demoSources"]
+needs = ["demoSources", "releaseVersion"]
 
 [[lean_lib]]
 name = "LeanTests"

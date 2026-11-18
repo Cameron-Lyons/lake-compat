@@ -17,6 +17,7 @@ Explain which locked dependencies need attention for a Lean upgrade.
   --build-timeout SECONDS  Time allowed for lake build (default: 600 seconds)
   --json                   Emit a machine-readable report
   --strict                 Exit 1 if the original lock has metadata findings
+  --version                Show the CLI version
   -h, --help               Show this help"
 
 structure Options where
