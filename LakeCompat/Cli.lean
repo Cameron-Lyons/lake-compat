@@ -68,7 +68,8 @@ private def displayDemo (root : FilePath) (report : Json) : Json :=
 
 private def scan (opts : Options) (project : FilePath) : IO Json := do
   checkProject project
-  let mut report ← analyze project opts.target
+  let (scanned, manifest) ← analyzeWithManifest project opts.target
+  let mut report := scanned
   let packages := Report.rows report "packages"
   let mut pins ← explicitPins packages opts.revisions
   if opts.suggest || opts.trySuggested then
@@ -79,7 +80,7 @@ private def scan (opts : Options) (project : FilePath) : IO Json := do
       report := report.setObjVal! "auto_selected" true
   if opts.verify || opts.trySuggested || !pins.isEmpty then
     let timeout := opts.buildTimeoutSeconds.getD defaultBuildTimeoutSeconds
-    let result ← verifyBuild project (Report.string report "target") pins.toArray (timeout * 1000)
+    let result ← verifyBuild project (Report.string report "target") pins.toArray (timeout * 1000) (some manifest)
     report := (report.setObjVal! "verification" result).setObjVal! "trial_revisions"
       (Json.mkObj (pins.toList.map fun (k, v) => (k, .str v)))
   return if opts.demo then displayDemo project report else report

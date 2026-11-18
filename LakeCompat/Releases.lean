@@ -14,6 +14,13 @@ inductive RegistryError where
   | invalid
   deriving BEq, Repr
 
+private def RegistryError.message : RegistryError → String
+  | .http 404 => "Package or release metadata is absent from the Reservoir index."
+  | .http code => s!"Reservoir returned HTTP {code}."
+  | .invalid => "Reservoir returned incomplete, oversized, or invalid metadata."
+  | .transport => "Could not reach Reservoir or finish reading its response."
+
+/-- Fetch package metadata first. Independent version and build requests may run concurrently. -/
 abbrev Fetch := String → EIO RegistryError Json
 
 private def registry := "https://reservoir.lean-lang.org/api/v1/packages"
@@ -34,7 +41,7 @@ private def fetchJson (url : String) : EIO RegistryError Json := do
   let (body?, status, exitCode) ← EIO.adapt (fun _ => .transport) do
     let child ← IO.Process.spawn {
       cmd := "curl"
-      args := #["--disable", "--silent", "--fail", "--max-time", "8", "--max-filesize",
+      args := #["--disable", "--silent", "--fail", "--compressed", "--max-time", "8", "--max-filesize",
                 toString byteLimit, "--header", "Accept: application/json", "--user-agent",
                 "lake-compat", "--write-out", "%{stderr}%{http_code}", "--", url]
       stdin := .null, stdout := .piped, stderr := .piped
@@ -170,7 +177,7 @@ private def candidate (target rev : String) (e : Evidence) : Json :=
 private def result (status message : String) (candidates : List Json := []) : Json :=
   Json.mkObj [("status", status), ("message", message), ("candidates", .arr candidates.toArray)]
 
-private def ranked (index : Index) (target : String) : Json := Id.run do
+private def ranked (index : Index) (target : String) (missing : String := "") : Json := Id.run do
   let mut best := []
   let mut count := 0
   for (rev, evidence) in index do
@@ -179,8 +186,10 @@ private def ranked (index : Index) (target : String) : Json := Id.run do
     let item := (priority rev evidence, rev, evidence)
     best := ([item].merge best fun a b => compare a.1 b.1 == .gt).take candidateLimit
   if best.isEmpty then
+    unless missing.isEmpty do return result "unavailable" missing
     return result "no_match" "No successful build or eligible revision declaring this target in Reservoir."
-  return result "found" s!"Showing {best.length} of {count} candidate revisions."
+  let summary := s!"Showing {best.length} of {count} candidate revisions."
+  return result "found" (if missing.isEmpty then summary else summary ++ " " ++ missing)
     (best.map fun (_, rev, evidence) => candidate target rev evidence)
 
 private def lookup (fetch : Fetch) (endpoint target repo : String) (package subDir : Option String) :
@@ -195,11 +204,23 @@ private def lookup (fetch : Fetch) (endpoint target repo : String) (package subD
   let .arr sources := metadata.getObjValD "sources" | throw .invalid
   unless matchesSource sources repo (subDir.getD ".") do
     return result "unsupported" "Registry source differs in repository or package directory."
-  let versions ← records (← fetch (endpoint ++ "/versions"))
-  let index ← ofExcept (indexVersions versions target)
-  let builds ← records (← fetch (endpoint ++ "/builds"))
-  let index ← ofExcept (indexBuilds index builds target)
-  return ranked index target
+  -- Both histories describe the source we just verified and can be retrieved independently.
+  let fetchRows := fun suffix => do records (← fetch (endpoint ++ suffix))
+  let buildsTask ← EIO.asTask (fetchRows "/builds") .dedicated
+  let versions ← (do ofExcept (indexVersions (← fetchRows "/versions") target)).toBaseIO
+  let declarations := versions.toOption.getD {}
+  let builds := (← IO.wait buildsTask).bind (indexBuilds declarations · target)
+  match versions, builds with
+  | .ok _, .ok index => return ranked index target
+  | .error err, .ok index =>
+    let report := ranked index target s!"Version history unavailable. {err.message}"
+    return report.setObjVal! "unavailable_history" "versions"
+  | .ok index, .error err =>
+    -- Malformed build records may include a known failure for an otherwise eligible declaration.
+    let usable := if err == .invalid then {} else index
+    let report := ranked usable target s!"Build history unavailable. {err.message}"
+    return report.setObjVal! "unavailable_history" "builds"
+  | .error err, .error _ => throw err
 
 private def registrySource (url : String) (package scope : Option String) : Except String (String × String) := do
   let some (owner, repo) := Source.githubRepo? url
@@ -220,12 +241,6 @@ def suggestVersions (url target : String) (package scope subDir : Option String 
     | .error message => return result "unsupported" message
   match ← (lookup fetch endpoint target repo (package.filter (!·.isEmpty)) subDir).toBaseIO with
   | .ok value => return value
-  | .error err =>
-    let message := match err with
-      | .http 404 => "Package or release metadata is absent from the Reservoir index."
-      | .http code => s!"Reservoir returned HTTP {code}."
-      | .invalid => "Reservoir returned incomplete, oversized, or invalid metadata."
-      | .transport => "Could not reach Reservoir or finish reading its response."
-    return result "unavailable" message
+  | .error err => return result "unavailable" err.message
 
 end LakeCompat.Releases

@@ -14,6 +14,7 @@ structure Trial where
   paths : Array (String × FilePath)
   packagesDir : FilePath := ".lake/packages"
   copiedPackages : Std.HashSet String := ∅
+  gitSubDirs : Array (String × FilePath) := #[]
   deriving Inhabited
 
 private def parts (p : FilePath) : List String :=
@@ -43,7 +44,18 @@ private def packageCacheDir (path : FilePath) : Except String FilePath := do
     throw s!"Cannot isolate packagesDir {path}; expected a project-relative cache directory."
   return mkFilePath components
 
-private def readTrial (project : FilePath) (revisions : Pins) : IO (Trial × String) := do
+/-- Lake resolves existing local Git remotes before fetching. Anchor a relative remote in the
+original workspace, including when the snapshot omits a nested repository's Git metadata. -/
+private def localGitRemote? (project : FilePath) (url : String) : IO (Option String) := do
+  let path : FilePath := url
+  -- A colon before any slash denotes a Git URL, remote helper, or scp-style address.
+  if path.isAbsolute || (url.takeWhile (· != '/')).contains ':' then return none
+  let remote := project / path
+  unless ← remote.pathExists do return none
+  return some (← IO.FS.realPath remote).toString
+
+private def readTrial (project : FilePath) (revisions : Pins) (expectedManifest : Option Json := none) :
+    IO (Trial × String) := do
   let project ← IO.FS.realPath project
   let hasLakefile ← ["lakefile.lean", "lakefile.toml"].anyM fun (name : String) => do
     return (← (project / name).metadata.toBaseIO).toOption.any (·.type == .file)
@@ -55,7 +67,12 @@ private def readTrial (project : FilePath) (revisions : Pins) : IO (Trial × Str
   unless isInside project resolved && info.type == .file && info.byteSize.toNat ≤ sourceByteLimit do
     throw <| IO.userError "Expected an in-tree manifest within the source snapshot size limit."
   let contents ← IO.FS.readFile resolved
-  let raw ← IO.ofExcept <| Json.parse contents
+  let raw ← IO.ofExcept <| (Json.parse contents).mapError fun error =>
+    if expectedManifest.isSome then s!"The project manifest became unreadable since the metadata scan: {error}"
+    else s!"{file}: {error}"
+  if let some expected := expectedManifest then
+    unless raw == expected do
+      throw <| IO.userError "The project manifest changed since the metadata scan. Rerun the check with the current lock."
   let lock ← IO.ofExcept <| Lock.ofJson file raw
   if parts lock.lakeDir != [".lake"] || (FilePath.mk lock.lakeDir).isAbsolute then
     throw <| IO.userError "Build verification currently supports the standard .lake metadata directory."
@@ -63,6 +80,7 @@ private def readTrial (project : FilePath) (revisions : Pins) : IO (Trial × Str
   let mut pins : Pins := ∅
   let mut paths := #[]
   let mut copiedPackages := ∅
+  let mut gitSubDirs := #[]
   -- Lock.ofJson validated the array if present. Lake defaults an omitted array to empty.
   let mut entries := (raw.getObjValD "packages").getArr?.toOption.getD #[]
   for i in [:entries.size] do
@@ -75,20 +93,25 @@ private def readTrial (project : FilePath) (revisions : Pins) : IO (Trial × Str
     | .path dir copy =>
       paths := paths.push (name, ← IO.ofExcept <| relative (.str dir) (name ++ ".dir"))
       if copy then copiedPackages := copiedPackages.insert name
-    | .git _ rev .. =>
+    | .git url rev subDir _ =>
+      if let some subDir := subDir then
+        gitSubDirs := gitSubDirs.push (name, ⟨subDir⟩)
       let revision := revisions[name]?.getD rev
       unless Source.isFullRevision revision do
         throw <| IO.userError s!"{name} needs a full 40- or 64-character Git commit in the trial manifest."
       pins := pins.insert name revision.toLower
+      let mut pinned := fields
+      if let some remote ← localGitRemote? project url then
+        pinned := pinned.setObjVal! "url" (.str remote)
       if revisions.contains name then
-        let pinned := fields.setObjVal! "rev" (.str revision)
-        let pinned := pinned.setObjVal! (if tagged then "inputRev?" else "inputRev") (.str revision)
-        entries := entries.set! i (if tagged then Json.mkObj [(kind, pinned)] else pinned)
+        pinned := pinned.setObjVal! "rev" (.str revision)
+        pinned := pinned.setObjVal! (if tagged then "inputRev?" else "inputRev") (.str revision)
+      entries := entries.set! i (if tagged then Json.mkObj [(kind, pinned)] else pinned)
   let unknown := revisions.keys.filter (!pins.contains ·)
   unless unknown.isEmpty do
     throw <| IO.userError s!"Trial revisions must name locked Git packages: {String.intercalate ", " unknown}."
-  let manifest := if revisions.isEmpty then raw else raw.setObjVal! "packages" (.arr entries)
-  return ({manifest, packagesDir, pins, paths, copiedPackages}, contents)
+  let manifest := if entries.isEmpty then raw else raw.setObjVal! "packages" (.arr entries)
+  return ({manifest, packagesDir, pins, paths, copiedPackages, gitSubDirs}, contents)
 
 /-- Keep the original JSON representation so future Lake fields, tagged entries and package order
 survive trial revision edits. -/
@@ -97,8 +120,9 @@ def loadTrial (project : FilePath) (revisions : Pins) : IO Trial := do
 
 /-- Read the cache location before copying and confirm the copied lock matches this input.
 Only real directories may lead to the freshly materialized checkouts. -/
-def prepareTrial (project workspace : FilePath) (revisions : Pins) (configuredDir : IO FilePath) : IO Trial := do
-  let (initial, contents) ← readTrial project revisions
+def prepareTrial (project workspace : FilePath) (revisions : Pins) (configuredDir : IO FilePath)
+    (expectedManifest : Option Json := none) : IO Trial := do
+  let (initial, contents) ← readTrial project revisions expectedManifest
   let mut trial := initial
   let managed := trial.pins.foldl (init := trial.copiedPackages) fun names name _ => names.insert name
   if !managed.isEmpty && (trial.manifest.getObjValD "packagesDir").isNull then
@@ -120,6 +144,12 @@ def prepareTrial (project workspace : FilePath) (revisions : Pins) (configuredDi
 def Trial.checkLocalPaths (trial : Trial) (root : FilePath) (materialized : Bool) : IO Unit := do
   let cacheParts := trial.packagesDir.components
   if materialized then
+    for (name, subDir) in trial.gitSubDirs do
+      let checkout := root / trial.packagesDir / name
+      let package := checkout / subDir
+      if ← package.isDir then
+        if isInside checkout (← IO.FS.realPath package) then continue
+      throw <| IO.userError s!"The package directory {subDir} for {name} must resolve to a directory in its locked checkout."
     for name in trial.copiedPackages do
       let destination := root / trial.packagesDir / name
       if (← metadata? destination).any (·.type == .dir) then
@@ -141,6 +171,8 @@ def Trial.checkLocalPaths (trial : Trial) (root : FilePath) (materialized : Bool
     else if components.contains ".lake" then
       throw <| IO.userError s!"{name} has a cache path outside the materialized packages."
     let resolved ← IO.FS.realPath (root / path)
+    if trial.copiedPackages.contains name && isInside resolved (root / trial.packagesDir / name) then
+      throw <| IO.userError s!"Cannot copy {name} into its own source directory at {path}."
     let inside := if owners.isEmpty then isInside root resolved else
       owners.any fun owner => isInside (root / trial.packagesDir / owner) resolved
     unless inside && (← resolved.isDir) do

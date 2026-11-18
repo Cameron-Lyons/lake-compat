@@ -1,11 +1,13 @@
 import LakeCompat.Cli
+import LeanTests.Cli
 import LeanTests.Concurrent
+import LeanTests.Distribution
+import LeanTests.Graph
 import LeanTests.Releases
+import LeanTests.Support
+import LeanTests.Verify
 
-open LakeCompat Lean
-
-private def check (condition : Bool) (message : String) : IO Unit :=
-  unless condition do throw (IO.userError message)
+open LakeCompat Lean LeanTests.Support
 
 private def toolchains : IO Unit := do
   let stable := "leanprover/lean4:v4.25.0"
@@ -18,10 +20,19 @@ private def toolchains : IO Unit := do
   for input in ["", "   \n", "a b", "owner/repo:"] do
     check ((normalizeToolchain input).toOption.isNone) s!"invalid toolchain '{input}'"
 
-def main : IO Unit := do
+def main (args : List String) : IO UInt32 := do
+  if let some mode ← IO.getEnv "LAKECOMPAT_CLI_FIXTURE" then return ← LeanTests.Cli.fixture mode args
+  if (← IO.getEnv "LAKECOMPAT_TAR_FIXTURE").isSome then return ← LeanTests.Distribution.failTar args
+  if let "verify-fixture" :: rest := args then return ← LeanTests.Verify.verifyFixture rest
+  if args.head? == some "run" && (← IO.getEnv "LAKECOMPAT_TEST_ELAN").isSome then
+    return ← LeanTests.Verify.fakeElan args
   toolchains
   LeanTests.Concurrent.run
   LeanTests.Releases.run
+  LeanTests.Cli.run
+  LeanTests.Graph.run
+  LeanTests.Verify.run
+  LeanTests.Distribution.run
   withDemo fun project => do
     let report ← analyze project "4.36.0"
     let findings := Report.rows report "findings"
@@ -30,3 +41,4 @@ def main : IO Unit := do
     check ((Report.render report).contains "upgradeDemo -> greeting") "missing dependency path"
     check (Report.exitCode report true == 1 && Report.exitCode report false == 0) "strict exit code"
   IO.println "Lean tests passed"
+  return 0

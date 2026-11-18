@@ -66,7 +66,7 @@ private def configuredPackagesDir (project parent : FilePath) (target : String) 
   return ".lake/packages"
 
 private def verifyTrial (parent project : FilePath) (target : String) (revisions : Pins)
-    (buildTimeoutMs : Nat) (detail : IO.Ref Json) : IO Json := do
+    (buildTimeoutMs : Nat) (detail : IO.Ref Json) (expectedManifest : Option Json) : IO Json := do
   let env ← trialEnvironment target parent
   let lake := #["elan", "run", target, "lake"]
   let version ← run (lake.push "--version") parent env 20000 detail
@@ -75,6 +75,7 @@ private def verifyTrial (parent project : FilePath) (target : String) (revisions
       (Json.mkObj [("output", .str version.output)])
   let workspace := parent / "project"
   let trial ← prepareTrial project workspace revisions (configuredPackagesDir project parent target lake env detail)
+    expectedManifest
   trial.checkLocalPaths workspace false
   let pinFile := workspace / "lean-toolchain"
   let lockFile := workspace / manifestName
@@ -124,7 +125,7 @@ def defaultBuildTimeoutSeconds : Nat := 600
 
 /-- Verify the default build on an installed Elan toolchain using an isolated working-source copy. -/
 def verifyBuild (project : FilePath) (target : String) (revisions : Array (String × String) := #[])
-    (buildTimeoutMs : Nat := defaultBuildTimeoutSeconds * 1000) : IO Json := do
+    (buildTimeoutMs : Nat := defaultBuildTimeoutSeconds * 1000) (expectedManifest : Option Json := none) : IO Json := do
   if Platform.isWindows then return Verify.report "unavailable" "Build verification requires a POSIX host."
   if target.isEmpty || target.startsWith "-" || target.any Char.isWhitespace || target.contains (Char.ofNat 0) then
     return Verify.report "inconclusive" "Invalid elan toolchain name."
@@ -140,7 +141,7 @@ def verifyBuild (project : FilePath) (target : String) (revisions : Array (Strin
       pins := pins.insert name revision.toLower
     let temp ← IO.FS.createTempDir
     try
-      Verify.verifyTrial (← IO.FS.realPath temp) source target pins buildTimeoutMs detail
+      Verify.verifyTrial (← IO.FS.realPath temp) source target pins buildTimeoutMs detail expectedManifest
     finally
       Verify.removeTrialTree temp
   catch e => return Verify.report "inconclusive" (toString e) (← detail.get)
