@@ -60,6 +60,7 @@ private structure DirectoryQuery (α : Type) where
   path : FilePath
   gitRepo : Option FilePath := none
   workspaceLinks : Nat := 0
+  issues : Array Issue := #[]
 
 private inductive WorkspaceComponent where
   | path (resolved : FilePath)
@@ -185,12 +186,12 @@ private structure Directory where
   committed : Bool := false
   issues : Array Issue := #[]
 
-private abbrev Inspect (α β : Type) := α → FilePath → Except Issue Directory → IO β
+private abbrev Inspect (α β : Type) := DirectoryQuery α → Except Issue Directory → IO β
 private abbrev BatchResult (α β : Type) := Sum (DirectoryQuery α) β
 
 private def inspectGit (repo : FilePath) (revision : String) (env : GitTree.Env)
     (group : Array (DirectoryQuery α)) (inspect : Inspect α β) : IO (Array (BatchResult α β)) := do
-  let finish := fun (q : DirectoryQuery α) result => Sum.inr <$> inspect q.key q.path result
+  let finish := fun (q : DirectoryQuery α) result => Sum.inr <$> inspect q result
   unless ← repo.isDir do
     return ← group.mapM fun q => finish q (.error ("missing_checkout", s!"Package directory is missing: {q.path}"))
   let fallback := fun () => do
@@ -204,15 +205,22 @@ private def inspectGit (repo : FilePath) (revision : String) (env : GitTree.Env)
         s!"Could not verify Git revision {revision} for {repo}. The available metadata comes from the working directory.")] })
   unless ← (repo / ".git").pathExists do return ← fallback ()
   let batch ← (GitTree.withReader repo env fun git => do
-    let some head ← git.head? | return none
-    if head.toLower != revision.toLower then
-      return some (← group.mapM fun q => finish q (.error ("checkout_revision_mismatch",
-        s!"Checkout is at {head}. The root manifest selects {revision}.")))
+    let head ← git.head?
+    let commit := revision.toLower
+    let mut group := group
+    if head != some commit then
+      let issue := match head with
+        | some hash => ("checkout_revision_mismatch", s!"Checkout is at {hash}. The root manifest selects {revision}.")
+        | none => ("unknown_checkout_revision", s!"Could not verify the checkout's HEAD in {repo}.")
+      let .ok true ← (git.hasCommit commit).toBaseIO | do
+        if head.isNone then return none
+        return some (← group.mapM fun q => finish q (.error issue))
+      group := group.map fun q => if q.issues.contains issue then q else { q with issues := q.issues.push issue }
     let results ← group.mapM fun q => do
-      match ← (git.directoryOrExit head q.path).toBaseIO with
+      match ← (git.directoryOrExit commit q.path).toBaseIO with
       | .error e => finish q (.error ("unknown_package_directory", toString e))
       | .ok (.inside path) =>
-        finish q (.ok { path, repo := some repo, readText := git.readText? head, committed := true })
+        finish q (.ok { path, repo := some repo, readText := git.readText? commit, committed := true })
       | .ok (.outside remaining) =>
         if q.gitRepo.isSome then
           return ← finish q (.error ("unknown_package_directory", s!"{q.path} leaves the locked repository"))
@@ -237,12 +245,12 @@ private def inspectDirectories (repos : Repositories) (env : GitTree.Env)
       let (q, repo) ← match located with
         | .ok location => pure location
         | .error e =>
-          results := results.push (← inspect q.key q.path (.error ("unknown_package_directory", toString e)))
+          results := results.push (← inspect q (.error ("unknown_package_directory", toString e)))
           continue
       if let some repo := repo then
         groups := groups.alter repo fun group => some ((group.getD #[]).push q)
       else
-        results := results.push (← inspect q.key q.path (.ok { path := q.path }))
+        results := results.push (← inspect q (.ok { path := q.path }))
     pending := #[]
     let batches ← mapConcurrent groups.toArray fun (repo, group) =>
       inspectGit repo repos[repo]! env group inspect
@@ -266,14 +274,14 @@ private def observe (project packages : FilePath) (lock : Lock) (repos : Reposit
       queries := queries.push {key := entry, path := subDir.elim repo (repo / ·), gitRepo := some repo}
     | .path dir copy =>
       queries := queries.push {key := entry, path := if copy then packages / name else project / dir}
-  let observations ← inspectDirectories repos env queries fun entry path result => do
+  let observations ← inspectDirectories repos env queries fun q result => do
     let obs ← match result with
-      | .error (kind, message) => pure (problem ⟨entry, path⟩ kind message)
+      | .error (kind, message) => pure (problem ⟨q.key, q.path⟩ kind message)
       | .ok dir => do
-        let p := ⟨entry, dir.path⟩
+        let p := ⟨q.key, dir.path⟩
         if dir.committed || (← dir.path.isDir) then readPackage p project dir.repo dir.readText dir.issues
         else pure (missing p)
-    return (obs, result.map (·.path))
+    return ({obs with issues := q.issues ++ obs.issues}, result.map (·.path))
   let mut packages := ∅
   let mut sources := ∅
   for (obs, path) in observations do
@@ -307,10 +315,9 @@ private def sameRemote (a b : String) : Bool :=
     | _, _ => false
 
 private def sourcePaths (project : FilePath) (repos : Repositories) (env : GitTree.Env)
-    (observations : Observations) (paths : Std.HashMap String (List String)) (known : SourcePaths) : IO SourcePaths := do
+    (observations : Observations) (known : SourcePaths) : IO SourcePaths := do
   let mut requested : Std.HashSet FilePath := ∅
-  for (name, parent) in observations do
-    unless paths.contains name do continue
+  for (_, parent) in observations do
     for (child, wanted) in parent.edges do
       let some selected := observations[child]? | continue
       if let .path dir _ := wanted.source then
@@ -321,7 +328,7 @@ private def sourcePaths (project : FilePath) (repos : Repositories) (env : GitTr
             unless known.contains left do requested := requested.insert left
             unless known.contains right do requested := requested.insert right
   let resolved ← inspectDirectories repos env (requested.toArray.map fun path => {key := path, path})
-    fun key _ result => pure (key, result.map (·.path))
+    fun q result => pure (q.key, result.map (·.path))
   return resolved.foldl (init := known) fun m (key, path) => m.insert key path
 
 private def conflict (parent : Observation) (wanted selected : LockedPackage) (project : FilePath)
@@ -382,7 +389,7 @@ def analyze (project : FilePath) (target : String) : IO Json := do
   let env ← if repos.isEmpty then pure #[] else GitTree.environment
   let (observations, known) ← observe project packagesDir lock repos env
   let paths := shortestPaths root observations
-  let sources ← sourcePaths project repos env observations paths known
+  let sources ← sourcePaths project repos env observations known
   let mut packages := #[]
   let mut findings := #[]
   let overrides := lakeDir / "package-overrides.json"
@@ -401,16 +408,16 @@ def analyze (project : FilePath) (target : String) : IO Json := do
         let note := if obs.fixedToolchain == some true then " Its manifest sets fixedToolchain." else ""
         issues := issues.push ("toolchain_mismatch", s!"{verb} {pin}. The target is {target}.{note}")
     for issue in issues do findings := findings.push (finding name path issue)
-    unless path.isEmpty do
-      for (child, wanted) in obs.edges do
-        let selected := lock.packages[child]?
-        let issue := match selected with
-          | some selected => conflict obs wanted selected project sources
-          | none => some ("unlocked_dependency", s!"{name} locks {child}, which is absent from the root manifest.")
-        if let some issue := issue then
-          let detail := Json.mkObj [("parent", name), ("requested_revision", toJson wanted.source.revision?),
-                                    ("selected_revision", toJson (selected.bind (·.source.revision?)))]
-          findings := findings.push ((finding child (path ++ [child]) issue).mergeObj detail)
+    for (child, wanted) in obs.edges do
+      let selected := lock.packages[child]?
+      let issue := match selected with
+        | some selected => conflict obs wanted selected project sources
+        | none => some ("unlocked_dependency", s!"{name} locks {child}, which is absent from the root manifest.")
+      if let some issue := issue then
+        let detail := Json.mkObj [("parent", name), ("requested_revision", toJson wanted.source.revision?),
+                                  ("selected_revision", toJson (selected.bind (·.source.revision?)))]
+        let chain := if path.isEmpty then [] else path ++ [child]
+        findings := findings.push ((finding child chain issue).mergeObj detail)
   return Json.mkObj [("project", root), ("target", target), ("root_toolchain", toJson rootPin),
                      ("packages", .arr packages), ("findings", .arr findings)]
 

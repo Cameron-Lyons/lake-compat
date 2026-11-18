@@ -1,6 +1,7 @@
 import Std.Internal.UV.System
 import Std.Data.HashMap
 import Init.Data.String
+import LakeCompat.Source
 
 namespace LakeCompat.GitTree
 open System
@@ -91,6 +92,12 @@ private def Reader.lookup (git : Reader) (spec : String) : IO Record := do
 def Reader.head? (git : Reader) : IO (Option String) := do
   let .found obj ← git.lookup "HEAD" | return none
   return if obj.type == "commit" then some obj.hash else none
+
+/-- Check for a complete, locally available commit ID without accepting symbolic refs or tags. -/
+def Reader.hasCommit (git : Reader) (revision : String) : IO Bool := do
+  unless Source.isFullRevision revision do return false
+  let .found obj ← git.lookup (revision ++ "^{commit}") | return false
+  return obj.type == "commit" && obj.hash == revision.toLower
 
 private def Object.text (obj : Object) (name : String) : IO String := do
   unless obj.type == "blob" do throw <| IO.userError s!"{name} does not resolve to a file"

@@ -173,12 +173,18 @@ class GraphTest(unittest.TestCase):
         manifest(repo)
         manifest(repo / "lib")
         revision = commit_metadata(repo)
-        for selected, requested, expected in [(None, ".", []), ("lib/", "./lib//.", []),
-                                              ("lib", ".", ["source_conflict"])]:
+        for selected, requested, expected in [
+            (None, ".", []),
+            ("lib/", "./lib//.", []),
+            ("lib", ".", ["source_conflict"]),
+        ]:
             with self.subTest(selected=selected, requested=requested):
                 manifest(parent, git_dep("child", revision, subDir=requested))
-                manifest(self.project, local_dep("parent", "parent"),
-                         git_dep("child", revision, True, subDir=selected))
+                manifest(
+                    self.project,
+                    local_dep("parent", "parent"),
+                    git_dep("child", revision, True, subDir=selected),
+                )
                 self.assertEqual([f["kind"] for f in self.report()["findings"]], expected)
 
     def test_external_path_does_not_borrow_unrelated_ancestor_pin(self):
@@ -210,6 +216,20 @@ class GraphTest(unittest.TestCase):
         self.assertEqual(
             [f["kind"] for f in self.report()["findings"]], ["missing_manifest", "missing_manifest"]
         )
+
+    def test_known_edges_are_checked_even_when_the_parent_chain_is_unavailable(self):
+        manifest(self.project, local_dep("orphan", "orphan", True), local_dep("leaf", "leaf"))
+        manifest(self.project / "orphan", local_dep("leaf", "../other"), git_dep("absent", "bb"))
+        manifest(self.project / "leaf")
+        findings = self.report()["findings"]
+        edges = [
+            (f["kind"], f["package"], f["path"]) for f in findings if f.get("parent") == "orphan"
+        ]
+        self.assertEqual(
+            edges, [("unlocked_dependency", "absent", []), ("source_conflict", "leaf", [])]
+        )
+        rendered = cli(TARGET, "--project", self.project, check=True).stdout
+        self.assertIn("orphan -> leaf (path to orphan unknown)", rendered)
 
     def test_malformed_nested_metadata_and_overrides(self):
         manifest(self.project, local_dep("a", "a"))
@@ -379,8 +399,12 @@ class GraphTest(unittest.TestCase):
     def test_sha256_tree_with_custom_manifest_path(self):
         repo = self.packages / "library"
         repo.mkdir(parents=True)
-        init = subprocess.run(["git", "init", "-q", "--object-format=sha256", repo],
-                              capture_output=True, text=True)
+        init = subprocess.run(
+            ["git", "init", "-q", "--object-format=sha256", repo],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         if init.returncode:
             self.skipTest(f"Git lacks SHA-256 repositories: {init.stderr}")
         package = repo / "library"
@@ -392,8 +416,10 @@ class GraphTest(unittest.TestCase):
         git(repo, "add", ".")
         git(repo, "commit", "-qm", "package")
         revision = git(repo, "rev-parse", "HEAD")
-        manifest(self.project, git_dep("library", revision, subDir="alias",
-                                       manifestFile=f"./config/{filename}"))
+        manifest(
+            self.project,
+            git_dep("library", revision, subDir="alias", manifestFile=f"./config/{filename}"),
+        )
         report = self.report()
         self.assertEqual(report["findings"], [])
         self.assertEqual(report["packages"][0]["checkout"], str(package))
@@ -405,11 +431,16 @@ class GraphTest(unittest.TestCase):
         (repo / "lean-toolchain").symlink_to("../../../lean-toolchain")
         (repo / "external").symlink_to("../../..", target_is_directory=True)
         revision = commit_metadata(repo)
-        manifest(self.project, git_dep("library", revision),
-                 local_dep("alias", ".lake/packages/library/external"))
+        manifest(
+            self.project,
+            git_dep("library", revision),
+            local_dep("alias", ".lake/packages/library/external"),
+        )
         report = self.report()
-        self.assertEqual({(f["package"], f["kind"]) for f in report["findings"]},
-                         {("library", "unknown_toolchain"), ("alias", "unknown_package_directory")})
+        self.assertEqual(
+            {(f["package"], f["kind"]) for f in report["findings"]},
+            {("library", "unknown_toolchain"), ("alias", "unknown_package_directory")},
+        )
         self.assertTrue(all(pkg["toolchain"] is None for pkg in report["packages"]))
 
     def test_symlinked_subdirectory_inherits_from_its_locked_destination(self):
@@ -439,11 +470,14 @@ class GraphTest(unittest.TestCase):
         (repo / "alias").unlink()
         (repo / "alias").symlink_to("other/inner/app", target_is_directory=True)
         (self.project / "vendor").symlink_to(".lake/packages", target_is_directory=True)
-        for source in ["./.lake/packages/mono/alias/../../child", "vendor/mono/alias/../../child",
-                       "vendor/mono/nested/child", "vendor/mono/other/child"]:
+        for source in [
+            "./.lake/packages/mono/alias/../../child",
+            "vendor/mono/alias/../../child",
+            "vendor/mono/nested/child",
+            "vendor/mono/other/child",
+        ]:
             with self.subTest(source=source):
-                manifest(self.project, git_dep("mono", revision),
-                         local_dep("child", source, True))
+                manifest(self.project, git_dep("mono", revision), local_dep("child", source, True))
                 result = self.report()
                 actual = "other/child" if source.endswith("/other/child") else "nested/child"
                 self.assertEqual(result["packages"][0]["checkout"], str(repo / actual))
@@ -465,8 +499,10 @@ class GraphTest(unittest.TestCase):
         (self.packages / "staging").mkdir()
         (self.project / "staging").symlink_to(".lake/packages/staging", target_is_directory=True)
         vendor = self.project / "vendor"
-        for target, source in [(repo / "alias", "vendor/../child"),
-                               ("staging/../mono/alias/../child", "vendor")]:
+        for target, source in [
+            (repo / "alias", "vendor/../child"),
+            ("staging/../mono/alias/../child", "vendor"),
+        ]:
             with self.subTest(target=target):
                 vendor.symlink_to(target, target_is_directory=True)
                 manifest(self.project, git_dep("mono", revision), local_dep("child", source, True))
@@ -480,12 +516,17 @@ class GraphTest(unittest.TestCase):
         pin(repo)
         manifest(repo)
         (self.packages / "loop").symlink_to("mono/../loop", target_is_directory=True)
-        manifest(self.project, git_dep("mono", commit_metadata(repo)),
-                 local_dep("loop", ".lake/packages/loop"))
+        manifest(
+            self.project,
+            git_dep("mono", commit_metadata(repo)),
+            local_dep("loop", ".lake/packages/loop"),
+        )
         result = cli(TARGET, "--project", self.project, "--json", timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        finding, = json.loads(result.stdout)["findings"]
-        self.assertEqual((finding["package"], finding["kind"]), ("loop", "unknown_package_directory"))
+        (finding,) = json.loads(result.stdout)["findings"]
+        self.assertEqual(
+            (finding["package"], finding["kind"]), ("loop", "unknown_package_directory")
+        )
 
     def test_local_path_can_cross_from_one_locked_repository_into_another(self):
         first = self.packages / "first"
@@ -496,12 +537,54 @@ class GraphTest(unittest.TestCase):
         manifest(second)
         pin(second / "child", "4.24.0")
         manifest(second / "child")
-        manifest(self.project, git_dep("first", commit_metadata(first)), git_dep("second", commit_metadata(second)),
-                 local_dep("child", ".lake/packages/first/../second/child", True))
+        manifest(
+            self.project,
+            git_dep("first", commit_metadata(first)),
+            git_dep("second", commit_metadata(second)),
+            local_dep("child", ".lake/packages/first/../second/child", True),
+        )
         pin(second / "child")
         result = self.report()
         self.assertEqual([f["kind"] for f in result["findings"]], ["toolchain_mismatch"])
         self.assertEqual(result["packages"][0]["checkout"], str(second / "child"))
+
+    def test_stale_checkout_reads_local_locked_commit_and_compares_its_source_paths(self):
+        repo = self.packages / "mono"
+        pin(repo)
+        manifest(repo, local_dep("child", "alias"))
+        manifest(repo / "old")
+        pin(repo / "old", "4.24.0")
+        (repo / "alias").symlink_to("old", target_is_directory=True)
+        revision = commit_metadata(repo)
+
+        manifest(repo)
+        (repo / "old").rename(repo / "new")
+        (repo / "alias").unlink()
+        (repo / "alias").symlink_to("new", target_is_directory=True)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "move the child and drop its requirement")
+        head = git(repo, "rev-parse", "HEAD")
+        manifest(
+            self.project,
+            git_dep("mono", revision.upper()),
+            local_dep("child", ".lake/packages/mono/../mono/old", True),
+        )
+
+        result = self.report()
+        child, parent = result["packages"]
+        self.assertEqual(child["path"], ["demo", "mono", "child"])
+        self.assertEqual(child["toolchain"], "leanprover/lean4:v4.24.0")
+        self.assertEqual(parent["toolchain"], TARGET)
+        self.assertEqual(
+            [(f["kind"], f["package"]) for f in result["findings"]],
+            [
+                ("checkout_revision_mismatch", "child"),
+                ("toolchain_mismatch", "child"),
+                ("checkout_revision_mismatch", "mono"),
+            ],
+        )
+        self.assertIn(head, result["findings"][0]["message"])
+        self.assertEqual(git(repo, "rev-parse", "HEAD"), head)
 
     @unittest.skipUnless(shutil.which("git"), "git needed to create a real checkout")
     def test_wrong_checkout_is_not_used_as_evidence(self):
@@ -531,6 +614,21 @@ class GraphTest(unittest.TestCase):
         result = self.report()
         self.assertEqual([f["kind"] for f in result["findings"]], ["checkout_revision_mismatch"])
         self.assertIsNone(result["packages"][0]["toolchain"])
+
+    def test_unborn_head_can_still_supply_the_locked_commit(self):
+        repo = self.packages / "lib"
+        manifest(repo)
+        pin(repo, "4.24.0")
+        manifest(self.project, git_dep("lib", commit_metadata(repo)))
+        git(repo, "symbolic-ref", "HEAD", "refs/heads/unborn")
+        pin(repo)
+
+        result = self.report()
+        self.assertEqual(result["packages"][0]["toolchain"], "leanprover/lean4:v4.24.0")
+        self.assertEqual(
+            [f["kind"] for f in result["findings"]],
+            ["unknown_checkout_revision", "toolchain_mismatch"],
+        )
 
     def test_invalid_root_input_has_actionable_file_context(self):
         result = cli(TARGET, "--project", self.project, "--json")
