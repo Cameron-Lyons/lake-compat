@@ -72,8 +72,28 @@ python3 dist/lake-compat.pyz 4.36.0 --demo
 
 Both build commands require the source checkout or source distribution and its Lean toolchain.
 
-## Tests
+## Development checks
 
-Run `lake test` for the native tests and `python3 -m unittest discover -v` for the CLI, Git, verification, and packaging integration tests. To exercise the installed toolchain end to end, run `lake exe lake-compat 4.36.0 --demo --verify`.
+CI runs the native and integration tests on Ubuntu with Python 3.9 and macOS with Python 3.15. Run the following commands from the source checkout in a Python virtual environment, with `actionlint` and `shellcheck` installed for workflow linting.
+
+```sh
+python -m pip install -r requirements-dev.txt
+ruff check .
+ruff format --check .
+actionlint
+lake --wfail lint --linters=.extra LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main LeanTests.VerifyDriver
+lake --wfail build LakeCompat lake-compat verify-test-driver
+lake --wfail test
+python -W error -m unittest discover -s tests -t . -v
+lake exe lake-compat "$(cat lean-toolchain)" --demo --verify
+```
+
+To check the distribution, build into an empty directory. The build frontend creates a source distribution, then builds the wheel from its contents. The smoke test installs that wheel in a fresh environment and checks the demo's JSON report with an empty `PATH`.
+
+```sh
+artifacts=$(mktemp -d)
+python -m build --outdir "$artifacts"
+python tools/check_wheel.py "$artifacts"/*.whl
+```
 
 Lake-compat is distributed under the Apache License, Version 2.0. [License](LICENSE)

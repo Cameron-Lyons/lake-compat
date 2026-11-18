@@ -20,3 +20,9 @@ lake-compat = "lake_compat.cli:main"
 
 [tool.setuptools]
 packages = ["lake_compat"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["B", "I", "UP"]

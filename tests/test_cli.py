@@ -1,10 +1,10 @@
-import os
-import sys
 import json
+import os
 import subprocess
+import sys
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import patch
 
 from tests.native import build_cli, cli
@@ -21,11 +21,17 @@ class CliTests(unittest.TestCase):
         package = self.project / ".lake/packages/lib"
         package.mkdir(parents=True)
         (package / "lean-toolchain").write_text("v4.19.0")
-        entry = {"name": "lib", "type": "git", "url": "https://github.com/example/lib",
-                 "rev": self.old, "inherited": False}
+        entry = {
+            "name": "lib",
+            "type": "git",
+            "url": "https://github.com/example/lib",
+            "rev": self.old,
+            "inherited": False,
+        }
         for directory, name, entries in [(package, "lib", []), (self.project, "app", [entry])]:
-            (directory / "lake-manifest.json").write_text(json.dumps(
-                {"name": name, "version": "1.2.0", "packages": entries}))
+            (directory / "lake-manifest.json").write_text(
+                json.dumps({"name": name, "version": "1.2.0", "packages": entries})
+            )
         (self.project / "lean-toolchain").write_text("v4.19.0")
 
     def call(self, *args):
@@ -51,8 +57,20 @@ class CliTests(unittest.TestCase):
 
         git("init", "--quiet")
         git("add", "lean-toolchain", "lake-manifest.json")
-        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-            "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "pin")
+        git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--quiet",
+            "-m",
+            "pin",
+        )
         lock = self.project / "lake-manifest.json"
         manifest = json.loads(lock.read_text())
         manifest["packages"][0]["rev"] = git("rev-parse", "HEAD")
@@ -105,20 +123,33 @@ class CliTests(unittest.TestCase):
     def test_automatic_trial_uses_selected_set_and_manual_overrides(self):
         responses = {
             "lib": {"name": "lib", "sources": [{"host": "github", "fullName": "example/lib"}]},
-            "versions": {"data": [{"revision": self.new, "tag": "v2", "toolchain": "leanprover/lean4:v4.20.0"}]},
+            "versions": {
+                "data": [
+                    {"revision": self.new, "tag": "v2", "toolchain": "leanprover/lean4:v4.20.0"}
+                ]
+            },
             "builds": {"data": []},
         }
-        path = self.tool("curl", "import json, sys\n"
-                         f"print(json.dumps({responses!r}[sys.argv[-1].split('/')[-1]]))\n"
-                         "sys.stderr.write('200')")
+        path = self.tool(
+            "curl",
+            "import json, sys\n"
+            f"print(json.dumps({responses!r}[sys.argv[-1].split('/')[-1]]))\n"
+            "sys.stderr.write('200')",
+        )
         # Capture what actually reached the manifest before stopping this fixture build.
-        self.tool("elan", "import json, pathlib, sys\n"
-                  "if sys.argv[-1] == 'build':\n"
-                  "    print(json.loads(pathlib.Path('lake-manifest.json').read_text())['packages'][0]['rev'])\n"
-                  "    sys.exit(1)")
+        self.tool(
+            "elan",
+            "import json, pathlib, sys\n"
+            "if sys.argv[-1] == 'build':\n"
+            "    print(json.loads(pathlib.Path('lake-manifest.json').read_text())['packages'][0]['rev'])\n"
+            "    sys.exit(1)",
+        )
         (self.project / "lakefile.toml").touch()
         with patch.dict(os.environ, PATH=path):
-            for extra, expected in [((), self.new), (("--try-revision", "lib=" + self.old), self.old)]:
+            for extra, expected in [
+                ((), self.new),
+                (("--try-revision", "lib=" + self.old), self.old),
+            ]:
                 code, raw = self.call("--try-suggested", "--json", *extra)
                 report = json.loads(raw)
                 self.assertEqual(code, 1, report)
@@ -136,8 +167,12 @@ class CliTests(unittest.TestCase):
             self.assertIn("Build unavailable", output)
 
     def test_parse_errors_are_machine_readable(self):
-        for args in [("--demo",), ("--try-revision", "lib=main"), ("--unknown",),
-                     ("--try-revision", "lib=" + self.old, "--try-revision", "lib=" + self.new)]:
+        for args in [
+            ("--demo",),
+            ("--try-revision", "lib=main"),
+            ("--unknown",),
+            ("--try-revision", "lib=" + self.old, "--try-revision", "lib=" + self.new),
+        ]:
             code, output = self.call("--json", *args)
             self.assertEqual(code, 2)
             self.assertTrue(json.loads(output)["error"])

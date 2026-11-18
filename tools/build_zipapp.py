@@ -1,8 +1,8 @@
 """Package the host's native Lean executable in a standalone Python zipapp."""
 
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
@@ -38,8 +38,11 @@ def build_zipapp(root, output):
         staged = Path(staging) / output.name
         staged.write_bytes(b"#!/usr/bin/env python3\n")
         with ZipFile(staged, "a") as archive:
-            for name, data in [("__main__.py", LAUNCHER), ("LICENSE", (root / "LICENSE").read_bytes()),
-                               ("native", binary.read_bytes())]:
+            for name, data in [
+                ("__main__.py", LAUNCHER),
+                ("LICENSE", (root / "LICENSE").read_bytes()),
+                ("native", binary.read_bytes()),
+            ]:
                 entry = ZipInfo(name)
                 entry.create_system = 3
                 entry.external_attr = 0o100644 << 16

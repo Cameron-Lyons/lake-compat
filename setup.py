@@ -1,9 +1,10 @@
 """Bundle the Lake executable in a platform-specific, Python-ABI-independent wheel."""
 
-from pathlib import Path
 import platform
 import shutil
 import sys
+from pathlib import Path
+
 from setuptools import setup
 from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.command.build_py import build_py
