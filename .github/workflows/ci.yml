@@ -1,24 +1,91 @@
-name: Test
-on: [push, pull_request]
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  merge_group:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  lint:
+    name: Python and workflow lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: leanprover/lean-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          use-github-cache: "false"
-          test: "true"
-      - run: python3 -m unittest discover -v
-      - run: lake exe lake-compat 4.36.0 --demo --verify
-      - name: Install and run the native wheel
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.15'
+      - run: python -m pip install -c requirements-dev.txt ruff
+      - run: ruff check --output-format=github .
+      - run: ruff format --check .
+      - name: Check GitHub Actions workflows and their shell commands
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color
+
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: '3.9'
+          - os: macos-latest
+            python: '3.15'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the project's Lean toolchain
+        uses: leanprover/lean-action@ba3fdfe5c4476c925da13bf11a005ddb47e47aee # v1.7.1
+        with:
+          auto-config: 'false'
+          use-github-cache: 'false'
+          use-mathlib-cache: 'false'
+      - name: Lint Lean sources and test drivers
+        if: runner.os == 'Linux'
+        run: lake --wfail lint --linters=.extra LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main LeanTests.VerifyDriver
+      - name: Build the library, CLI, and verification driver
+        run: lake --wfail build LakeCompat lake-compat verify-test-driver
+      - name: Run native tests
+        run: lake --wfail test
+      - name: Run integration tests
+        run: python -W error -m unittest discover -s tests -t . -v
+      - name: Verify the demo with the installed toolchain
+        run: lake exe lake-compat "$(cat lean-toolchain)" --demo --verify
+      - name: Build the sdist and test the wheel built from it
         run: |
-          python3 -m venv "$RUNNER_TEMP/wheel-env"
-          "$RUNNER_TEMP/wheel-env/bin/python" -m pip install .
-          cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/wheel-env/bin/lake-compat" 4.36.0 --demo --json
+          python -m pip install -c requirements-dev.txt build
+          python -m build --outdir "$RUNNER_TEMP/dist"
+          python tools/check_wheel.py "$RUNNER_TEMP"/dist/*.whl
+
+  required:
+    name: CI passed
+    needs: [lint, test]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every lint and test job to pass
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: '[[ "$LINT_RESULT" == success && "$TEST_RESULT" == success ]]'

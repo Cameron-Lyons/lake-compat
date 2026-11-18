@@ -14,8 +14,14 @@ TARGET = "leanprover/lean4:v4.25.0"
 
 
 def git_dep(name, rev, inherited=False, **kwargs):
-    return dict(name=name, rev=rev, inherited=inherited, type="git",
-                url=f"https://github.com/example/{name}.git", **kwargs)
+    return dict(
+        name=name,
+        rev=rev,
+        inherited=inherited,
+        type="git",
+        url=f"https://github.com/example/{name}.git",
+        **kwargs,
+    )
 
 
 def local_dep(name, directory, inherited=False, **kwargs):
@@ -24,7 +30,7 @@ def local_dep(name, directory, inherited=False, **kwargs):
 
 def manifest(directory, *packages, file="lake-manifest.json", **fields):
     directory.mkdir(parents=True, exist_ok=True)
-    data = dict(version="1.3.0", packages=list(packages), name=directory.name)
+    data = {"version": "1.3.0", "packages": list(packages), "name": directory.name}
     data.update(fields)
     (directory / file).write_text(json.dumps(data), encoding="utf-8")
 
@@ -35,9 +41,21 @@ def pin(directory, value=TARGET):
 
 
 def git(directory, *args):
-    return subprocess.check_output(["git", "-C", str(directory), "-c", "user.name=Test",
-                                    "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args],
-                                   text=True).strip()
+    return subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(directory),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        text=True,
+    ).strip()
 
 
 def commit_metadata(directory):
@@ -70,19 +88,29 @@ class GraphTest(unittest.TestCase):
         shared = commit_metadata(self.packages / "shared")
         manifest(self.packages / "a", git_dep("shared", "cccc"), git_dep("leaf", "stale", True))
         manifest(self.packages / "b", git_dep("shared", shared))
-        manifest(self.project, git_dep("a", commit_metadata(self.packages / "a")),
-                 git_dep("b", commit_metadata(self.packages / "b")),
-                 git_dep("shared", shared, True), git_dep("leaf", leaf, True))
+        manifest(
+            self.project,
+            git_dep("a", commit_metadata(self.packages / "a")),
+            git_dep("b", commit_metadata(self.packages / "b")),
+            git_dep("shared", shared, True),
+            git_dep("leaf", leaf, True),
+        )
 
         result = self.report()
         self.assertEqual(result["root_toolchain"], "leanprover/lean4:v4.24.0")
-        self.assertEqual({f["kind"] for f in result["findings"]}, {"revision_conflict", "toolchain_mismatch"})
+        self.assertEqual(
+            {f["kind"] for f in result["findings"]}, {"revision_conflict", "toolchain_mismatch"}
+        )
         self.assertEqual(len(result["findings"]), 2)
         conflict = next(f for f in result["findings"] if f["kind"] == "revision_conflict")
         self.assertEqual(conflict["path"], ["demo", "a", "shared"])
-        self.assertEqual((conflict["requested_revision"], conflict["selected_revision"]), ("cccc", shared))
-        self.assertEqual({p["name"]: p["path"] for p in result["packages"]}["leaf"],
-                         ["demo", "a", "shared", "leaf"])
+        self.assertEqual(
+            (conflict["requested_revision"], conflict["selected_revision"]), ("cccc", shared)
+        )
+        self.assertEqual(
+            {p["name"]: p["path"] for p in result["packages"]}["leaf"],
+            ["demo", "a", "shared", "leaf"],
+        )
 
     def test_git_source_conflict_at_same_commit_and_equivalent_remote_spellings(self):
         parent = self.project / "parent"
@@ -93,8 +121,12 @@ class GraphTest(unittest.TestCase):
         root_lock = git_dep("leaf", revision, inherited=True)
         manifest(self.project, local_dep("parent", "parent"), root_lock)
         pin(parent)
-        for url in ("https://github.com/Example/Leaf/", "ssh://git@github.com/example/leaf.git",
-                    "git@github.com:example/leaf.git", "https://github.com/another/leaf.git"):
+        for url in (
+            "https://github.com/Example/Leaf/",
+            "ssh://git@github.com/example/leaf.git",
+            "git@github.com:example/leaf.git",
+            "https://github.com/another/leaf.git",
+        ):
             with self.subTest(url=url):
                 requested = dict(git_dep("leaf", revision), url=url)
                 manifest(parent, requested)
@@ -102,8 +134,10 @@ class GraphTest(unittest.TestCase):
                 if "another" in url:
                     self.assertEqual(len(findings), 1)
                     finding = findings[0]
-                    self.assertEqual((finding["kind"], finding["path"]),
-                                     ("source_conflict", ["demo", "parent", "leaf"]))
+                    self.assertEqual(
+                        (finding["kind"], finding["path"]),
+                        ("source_conflict", ["demo", "parent", "leaf"]),
+                    )
                     self.assertEqual(finding["requested_revision"], finding["selected_revision"])
                     self.assertIn(url, finding["message"])
                     self.assertIn(root_lock["url"], finding["message"])
@@ -116,8 +150,12 @@ class GraphTest(unittest.TestCase):
         local = self.project / "local"
         manifest(lib, local_dep("local", "../../../local"), file="custom.json")
         pin(vendor)
-        manifest(self.project, git_dep("mono", commit_metadata(vendor), subDir="child", manifestFile="custom.json"),
-                 local_dep("local", "local", True), packagesDir="vendor")
+        manifest(
+            self.project,
+            git_dep("mono", commit_metadata(vendor), subDir="child", manifestFile="custom.json"),
+            local_dep("local", "local", True),
+            packagesDir="vendor",
+        )
         manifest(local)
         report = self.report()
         self.assertEqual(report["findings"], [])
@@ -137,30 +175,47 @@ class GraphTest(unittest.TestCase):
     def test_no_inferred_direct_edge_for_flat_transitives(self):
         pin(self.packages / "orphan", "4.20.0")
         manifest(self.packages / "orphan")
-        manifest(self.project, git_dep("parent", "p"), git_dep("orphan", commit_metadata(self.packages / "orphan"), True))
+        manifest(
+            self.project,
+            git_dep("parent", "p"),
+            git_dep("orphan", commit_metadata(self.packages / "orphan"), True),
+        )
         result = self.report()
         findings = {f["kind"]: f["path"] for f in result["findings"]}
-        self.assertEqual(findings, {"missing_checkout": ["demo", "parent"],
-                                    "toolchain_mismatch": [], "unknown_path": []})
+        self.assertEqual(
+            findings,
+            {"missing_checkout": ["demo", "parent"], "toolchain_mismatch": [], "unknown_path": []},
+        )
 
     def test_missing_child_lock_cannot_hide_missing_evidence(self):
         manifest(self.project, local_dep("a", "a"), local_dep("b", "b", manifestFile=None))
         for name in ("a", "b"):
             pin(self.project / name)
-        self.assertEqual([f["kind"] for f in self.report()["findings"]], ["missing_manifest", "missing_manifest"])
+        self.assertEqual(
+            [f["kind"] for f in self.report()["findings"]], ["missing_manifest", "missing_manifest"]
+        )
 
     def test_malformed_nested_metadata_and_overrides(self):
         manifest(self.project, local_dep("a", "a"))
         pin(self.project / "a")
-        manifest(self.project / "a", dict(name="b", type="path", dir="."))
+        manifest(self.project / "a", {"name": "b", "type": "path", "dir": "."})
         (self.project / ".lake").mkdir()
         (self.project / ".lake" / "package-overrides.json").write_text('{"packages":[]}')
         report = self.report()
-        self.assertEqual([f["kind"] for f in report["findings"]], ["active_overrides", "invalid_manifest"])
+        self.assertEqual(
+            [f["kind"] for f in report["findings"]], ["active_overrides", "invalid_manifest"]
+        )
 
     def test_legacy_manifest_and_quoted_name(self):
-        dep = {"name": "«my-lib»", "url": "https://github.com/example/my-lib", "rev": "aaa",
-               "inputRev?": "main", "subDir?": "sub", "inherited": False, "opts": {}}
+        dep = {
+            "name": "«my-lib»",
+            "url": "https://github.com/example/my-lib",
+            "rev": "aaa",
+            "inputRev?": "main",
+            "subDir?": "sub",
+            "inherited": False,
+            "opts": {},
+        }
         pkg = self.project / "lake-packages" / "my-lib" / "sub"
         manifest(pkg, version=6)
         pin(pkg)
@@ -187,8 +242,10 @@ class GraphTest(unittest.TestCase):
         manifest(self.project, local_dep("a", "a"))
         pin(self.project / "a")
         manifest(self.project / "a", git_dep("b", "bb"))
-        finding, = self.report()["findings"]
-        self.assertEqual((finding["kind"], finding["path"]), ("unlocked_dependency", ["demo", "a", "b"]))
+        (finding,) = self.report()["findings"]
+        self.assertEqual(
+            (finding["kind"], finding["path"]), ("unlocked_dependency", ["demo", "a", "b"])
+        )
 
     def test_modified_and_deleted_metadata_cannot_mask_locked_pins(self):
         repo = self.packages / "parent"
@@ -197,7 +254,9 @@ class GraphTest(unittest.TestCase):
         revision = commit_metadata(repo)
         manifest(self.project, git_dep("parent", revision))
         original = self.report()
-        self.assertEqual({f["kind"] for f in original["findings"]}, {"toolchain_mismatch", "unlocked_dependency"})
+        self.assertEqual(
+            {f["kind"] for f in original["findings"]}, {"toolchain_mismatch", "unlocked_dependency"}
+        )
 
         pin(repo, TARGET)
         manifest(repo)
@@ -244,14 +303,21 @@ class GraphTest(unittest.TestCase):
         manifest(repo / "front", local_dep("core", "../core"), file="custom.json")
         manifest(repo / "core")
         base = commit_metadata(repo)
-        manifest(self.project, git_dep("group", base, subDir="front", manifestFile="custom.json"),
-                 local_dep("core", ".lake/packages/group/front/../core", True))
-        pin(repo / "core", TARGET)   # ignored by Git
+        manifest(
+            self.project,
+            git_dep("group", base, subDir="front", manifestFile="custom.json"),
+            local_dep("core", ".lake/packages/group/front/../core", True),
+        )
+        pin(repo / "core", TARGET)  # ignored by Git
         pin(repo / "front", TARGET)  # untracked
         result = self.report()
-        self.assertEqual([(f["kind"], f["path"]) for f in result["findings"]], [
-            ("toolchain_mismatch", ["demo", "group", "core"]), ("toolchain_mismatch", ["demo", "group"]),
-        ])
+        self.assertEqual(
+            [(f["kind"], f["path"]) for f in result["findings"]],
+            [
+                ("toolchain_mismatch", ["demo", "group", "core"]),
+                ("toolchain_mismatch", ["demo", "group"]),
+            ],
+        )
         self.assertTrue(all(p["toolchain_source"] == "repository" for p in result["packages"]))
 
     def test_worktree_and_committed_metadata_symlinks(self):
@@ -293,8 +359,24 @@ class GraphTest(unittest.TestCase):
         pin(repo)
         manifest(repo, git_dep("imaginary", "xx"))
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=t@example.com",
-                        "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "sample"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "sample",
+            ],
+            check=True,
+        )
         result = self.report()
         self.assertEqual([f["kind"] for f in result["findings"]], ["checkout_revision_mismatch"])
         self.assertIsNone(result["packages"][0]["toolchain"])
@@ -303,8 +385,12 @@ class GraphTest(unittest.TestCase):
         result = cli(TARGET, "--project", self.project, "--json")
         self.assertEqual(result.returncode, 2)
         self.assertIn("lake-manifest.json", json.loads(result.stdout)["error"])
-        for package in ({"type": "path", "dir": "x"}, git_dep("a", "aa", scope=[]),
-                        git_dep("../a", "aa"), dict(name="a", type="git", inherited="false")):
+        for package in (
+            {"type": "path", "dir": "x"},
+            git_dep("a", "aa", scope=[]),
+            git_dep("../a", "aa"),
+            {"name": "a", "type": "git", "inherited": "false"},
+        ):
             manifest(self.project, package)
             result = cli(TARGET, "--project", self.project, "--json")
             self.assertEqual(result.returncode, 2)

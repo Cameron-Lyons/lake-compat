@@ -1,0 +1,3 @@
+# Keep the packaging check runnable on the minimum supported Python (3.9).
+build==1.4.4
+ruff==0.17.5

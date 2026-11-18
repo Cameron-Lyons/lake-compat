@@ -1,10 +1,10 @@
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from tests.native import ROOT as REPO
@@ -21,7 +21,8 @@ def setUpModule():
 def verify_build(project, target, *, revisions=None, timeout_ms=600000):
     output = subprocess.check_output(
         [str(DRIVER), str(project), target, str(timeout_ms), json.dumps(revisions or {})],
-        text=True, timeout=max(timeout_ms / 1000 + 5, 20),
+        text=True,
+        timeout=max(timeout_ms / 1000 + 5, 20),
     )
     return json.loads(output)
 
@@ -84,7 +85,9 @@ class VerifyBuildTests(unittest.TestCase):
         cache = self.project / ".lake/build"
         cache.mkdir(parents=True)
         (cache / "stale.olean").touch()
-        self.write_elan("pathlib.Path('Main.lean').write_text('-- changed during build')\nprint('done')")
+        self.write_elan(
+            "pathlib.Path('Main.lean').write_text('-- changed during build')\nprint('done')"
+        )
         original = self.lock.read_bytes()
         report = verify_build(self.project, self.target)
         self.assertEqual(report["status"], "passed", report)
@@ -107,10 +110,12 @@ class VerifyBuildTests(unittest.TestCase):
         self.assertIn("ERROR at Main.lean:3", report["output"])
 
     def test_build_failure_preserves_first_diagnostic_and_final_summary(self):
-        self.write_elan("print('Resolved dependency\\n' * 2000)\n"
-                        "print('error: ./Main.lean:3:8: Type mismatch\\n  expected Nat')\n"
-                        "print('Built another target\\n' * 3000)\n"
-                        "print('error: build failed')\nsys.exit(1)")
+        self.write_elan(
+            "print('Resolved dependency\\n' * 2000)\n"
+            "print('error: ./Main.lean:3:8: Type mismatch\\n  expected Nat')\n"
+            "print('Built another target\\n' * 3000)\n"
+            "print('error: build failed')\nsys.exit(1)"
+        )
         report = verify_build(self.project, self.target)
         self.assertEqual(report["status"], "failed", report)
         self.assertLessEqual(len(report["output"]), LOG_BYTES)
@@ -125,8 +130,10 @@ class VerifyBuildTests(unittest.TestCase):
         self.write_elan(check_body="pathlib.Path('lake-manifest.json').write_text('{}')")
         result = verify_build(self.project, self.target)
         self.assertIn("changed", result["message"])
-        self.write_elan("pathlib.Path('.lake').mkdir()\n"
-                        "pathlib.Path('.lake/package-overrides.json').write_text('{}')")
+        self.write_elan(
+            "pathlib.Path('.lake').mkdir()\n"
+            "pathlib.Path('.lake/package-overrides.json').write_text('{}')"
+        )
         result = verify_build(self.project, self.target)
         self.assertEqual(result["status"], "inconclusive")
         self.assertIn("overrides", result["message"])
@@ -134,7 +141,9 @@ class VerifyBuildTests(unittest.TestCase):
     def test_no_elan_or_installed_target(self):
         with patch.dict(os.environ, PATH=str(self.root / "empty-bin")):
             self.assertEqual(verify_build(self.project, self.target)["status"], "unavailable")
-        self.elan.write_text(f"#!{sys.executable}\nimport sys\nprint('no such toolchain')\nsys.exit(1)\n")
+        self.elan.write_text(
+            f"#!{sys.executable}\nimport sys\nprint('no such toolchain')\nsys.exit(1)\n"
+        )
         result = verify_build(self.project, self.target)
         self.assertEqual(result["status"], "unavailable")
         self.assertIn("no such toolchain", result["output"])
@@ -164,7 +173,8 @@ class VerifyBuildTests(unittest.TestCase):
             "assert os.readlink('shared') == 'lib-link/Shared.lean'\n"
             "assert os.readlink('lib-link') == 'lib'\n"
             "assert pathlib.Path('shared').read_text() == 'shared input'\n"
-            "assert pathlib.Path('lib-link/main-link').read_text() == pathlib.Path('Main.lean').read_text()")
+            "assert pathlib.Path('lib-link/main-link').read_text() == pathlib.Path('Main.lean').read_text()"
+        )
         self.assertEqual(verify_build(self.project, self.target)["status"], "passed")
 
     def test_trial_metadata_links_leave_their_targets_intact(self):
@@ -174,14 +184,21 @@ class VerifyBuildTests(unittest.TestCase):
         self.lock.symlink_to("original-lock")
         self.write_elan(
             f"assert pathlib.Path('original-toolchain').read_text() == {self.original_toolchain!r}\n"
-            f"assert pathlib.Path('original-lock').read_text() == {json.dumps(self.manifest)!r}")
+            f"assert pathlib.Path('original-lock').read_text() == {json.dumps(self.manifest)!r}"
+        )
         self.assertEqual(verify_build(self.project, self.target)["status"], "passed")
         self.assertTrue(self.lock.is_symlink())
         self.assertTrue((self.project / "lean-toolchain").is_symlink())
 
     def test_invalid_link_targets_and_special_files(self):
         link = self.project / "lib-link"
-        for target in ("../src/Main.lean", "missing", ".git/config", ".lake/build/M.olean", "lib-link"):
+        for target in (
+            "../src/Main.lean",
+            "missing",
+            ".git/config",
+            ".lake/build/M.olean",
+            "lib-link",
+        ):
             with self.subTest(target=target):
                 link.symlink_to(target)
                 result = verify_build(self.project, self.target)
@@ -214,7 +231,8 @@ class VerifyBuildTests(unittest.TestCase):
         self.write_elan(
             f"pathlib.Path({str(temp_path)!r}).write_text(str(pathlib.Path.cwd()))\n"
             "pathlib.Path('dangling').symlink_to('missing')\n"
-            f"pathlib.Path('external-link').symlink_to({str(external)!r})")
+            f"pathlib.Path('external-link').symlink_to({str(external)!r})"
+        )
         result = verify_build(self.project, self.target)
         self.assertEqual(result["status"], "passed", result)
         self.assertFalse(Path(temp_path.read_text()).exists())
@@ -223,8 +241,9 @@ class VerifyBuildTests(unittest.TestCase):
     def test_timeout(self):
         self.write_elan(
             "child = 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "print(\"compiler still running\", flush=True); time.sleep(90)'\n"
-            "subprocess.Popen([sys.executable, '-c', child])")
+            'print("compiler still running", flush=True); time.sleep(90)\'\n'
+            "subprocess.Popen([sys.executable, '-c', child])"
+        )
         report = verify_build(self.project, self.target, timeout_ms=500)
         self.assertEqual(report["status"], "inconclusive")
         self.assertIn("timeout", report["message"])
@@ -233,20 +252,28 @@ class VerifyBuildTests(unittest.TestCase):
     def test_verified_trial_revision_requires_correct_checkout(self):
         git_repo = self.root / "dep"
         git_repo.mkdir()
+
         def git(*args):
             return subprocess.check_output(["git", "-C", str(git_repo), *args], text=True).strip()
+
         git("init", "--quiet")
         for folder in ("core", "postgres"):
             (git_repo / folder).mkdir()
             (git_repo / folder / "lakefile.lean").write_text("-- package")
         git("add", ".")
-        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q",
-            "-m", "dep")
+        git(
+            "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "dep"
+        )
         revision = git("rev-parse", "HEAD")
         old_revision = "a" * 40
         self.manifest["packages"] = [
-            {"name": "«dep-postgres»", "type": "git", "rev": old_revision,
-             "url": str(git_repo), "subDir": "postgres"},
+            {
+                "name": "«dep-postgres»",
+                "type": "git",
+                "rev": old_revision,
+                "url": str(git_repo),
+                "subDir": "postgres",
+            },
             {"name": "core", "type": "path", "dir": ".lake/packages/dep-postgres/postgres/../core"},
             {"name": "local", "type": "path", "dir": "vendor/mirror/../local"},
         ]
@@ -256,50 +283,89 @@ class VerifyBuildTests(unittest.TestCase):
         self.write_elan(
             "lock = json.loads(pathlib.Path('lake-manifest.json').read_text())\n"
             f"assert lock['packages'][0]['rev'] == {revision!r}\n"
-            f"subprocess.check_call(['git', 'clone', '--quiet', {str(git_repo)!r}, '.lake/packages/dep-postgres'])")
+            f"subprocess.check_call(['git', 'clone', '--quiet', {str(git_repo)!r}, '.lake/packages/dep-postgres'])"
+        )
         result = verify_build(self.project, self.target, revisions={"dep-postgres": revision})
         self.assertEqual(result["status"], "passed", result)
         self.assertEqual(result["checked_revisions"], {"dep-postgres": revision})
         self.assertEqual(json.loads(self.lock.read_text()), self.manifest)
         self.write_elan(
-            f"subprocess.check_call(['git', 'clone', '--quiet', {str(git_repo)!r}, '.lake/packages/dep-postgres'])")
+            f"subprocess.check_call(['git', 'clone', '--quiet', {str(git_repo)!r}, '.lake/packages/dep-postgres'])"
+        )
         result = verify_build(self.project, self.target)
         self.assertEqual(result["status"], "inconclusive")
         self.assertIn("locked revision", result["message"])
         self.write_elan(
             f"subprocess.check_call(['git', 'clone', '--quiet', {str(git_repo)!r}, '.lake/packages/dep-postgres'])\n"
-            "pathlib.Path('.lake/packages/dep-postgres/postgres/lakefile.lean').write_text('-- changed')")
+            "pathlib.Path('.lake/packages/dep-postgres/postgres/lakefile.lean').write_text('-- changed')"
+        )
         result = verify_build(self.project, self.target, revisions={"dep-postgres": revision})
         self.assertEqual(result["status"], "inconclusive")
         self.assertIn("tracked files", result["message"])
 
     def test_unknown_and_invalid_trial_revisions(self):
-        self.assertEqual(verify_build(self.project, self.target,
-                                             revisions={"missing": "a" * 40})["status"], "inconclusive")
-        self.manifest["packages"] = [{"name": "dep", "type": "git", "url": "https://example.org/dep", "rev": "a" * 40}]
+        self.assertEqual(
+            verify_build(self.project, self.target, revisions={"missing": "a" * 40})["status"],
+            "inconclusive",
+        )
+        self.manifest["packages"] = [
+            {"name": "dep", "type": "git", "url": "https://example.org/dep", "rev": "a" * 40}
+        ]
         self.save_manifest()
-        self.assertIn("40- or 64-character", verify_build(self.project, self.target,
-                                                         revisions={"dep": "main"})["message"])
+        self.assertIn(
+            "40- or 64-character",
+            verify_build(self.project, self.target, revisions={"dep": "main"})["message"],
+        )
 
     def test_sha256_trial_keeps_tagged_manifest_fields(self):
         repo = self.root / "sha256-dep"
-        init = subprocess.run(["git", "init", "-q", "--object-format=sha256", repo],
-                              capture_output=True, text=True)
+        init = subprocess.run(
+            ["git", "init", "-q", "--object-format=sha256", repo],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         if init.returncode:
             self.skipTest(f"Git lacks SHA-256 repositories: {init.stderr}")
-        subprocess.run(["git", "-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-                        "commit", "--allow-empty", "-qm", "dep"], check=True)
-        revision = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "dep",
+            ],
+            check=True,
+        )
+        revision = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+        ).strip()
         self.assertEqual(len(revision), 64)
-        entry = {"git": {"name": "dep", "url": str(repo), "inherited": False, "rev": "0" * 64,
-                         "inputRev?": "main", "subDir?": None, "extra": {"keep": True}}}
+        entry = {
+            "git": {
+                "name": "dep",
+                "url": str(repo),
+                "inherited": False,
+                "rev": "0" * 64,
+                "inputRev?": "main",
+                "subDir?": None,
+                "extra": {"keep": True},
+            }
+        }
         self.lock.write_text(json.dumps({"version": 6, "packages": [entry]}))
         self.write_elan(
             "lock = json.loads(pathlib.Path('lake-manifest.json').read_text())\n"
             "fields = lock['packages'][0]['git']\n"
             f"assert fields['rev'] == fields['inputRev?'] == {revision!r}\n"
             "assert 'inputRev' not in fields and fields['extra'] == {'keep': True}\n"
-            f"subprocess.check_call(['git', 'clone', '-q', {str(repo)!r}, '.lake/packages/dep'])")
+            f"subprocess.check_call(['git', 'clone', '-q', {str(repo)!r}, '.lake/packages/dep'])"
+        )
         result = verify_build(self.project, self.target, revisions={"dep": revision.upper()})
         self.assertEqual(result["status"], "passed", result)
         self.assertEqual(result["checked_revisions"], {"dep": revision})
