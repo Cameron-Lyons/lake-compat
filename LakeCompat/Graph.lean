@@ -17,7 +17,11 @@ private structure Checkout where
   revision : String
   deriving BEq, Hashable, Inhabited
 
-private abbrev Repositories := Std.HashMap FilePath (Except String Checkout)
+private abbrev RepoMap := Std.HashMap FilePath (Except String Checkout)
+
+private structure Repositories where
+  exact : RepoMap
+  folded : Std.HashMap String (List FilePath)
 
 private def fileText? (file : FilePath) : IO (Option String) := do
   try return some (← IO.FS.readFile file)
@@ -60,14 +64,22 @@ private partial def resolvePath (p : FilePath) : IO FilePath := do
       return (← resolvePath parent) / leaf
     | e => throw e
 
-private structure Located where
+/-- A relative requirement inside a locked tree starts at its parent's commit, including
+when multiple package cache entries are symlinks to the same worktree. -/
+private structure SourcePath where
+  path : FilePath
+  origin : Option Checkout := none
+  deriving BEq, Hashable, Inhabited
+
+private def SourcePath.join (base : SourcePath) (dir : FilePath) : SourcePath :=
+  if dir.isAbsolute then {path := dir} else {base with path := base.path / dir}
+
+private structure Located extends SourcePath where
   entry : LockedPackage
-  checkout : FilePath
   deriving Inhabited
 
-private structure DirectoryQuery (α : Type) where
+private structure DirectoryQuery (α : Type) extends SourcePath where
   key : α
-  path : FilePath
   gitRepo : Option FilePath := none
   workspaceLinks : Nat := 0
   issues : Array Issue := #[]
@@ -94,18 +106,6 @@ private def workspaceLinkTarget (p : FilePath) : IO FilePath := do
   let raw ← IO.Process.run {cmd := "readlink", args := #[p.toString]}
   return ⟨(raw.dropSuffix "\n").copy⟩
 
-private def workspaceComponent (cache : PrefixCache) (p : FilePath) : IO WorkspaceComponent := do
-  if let some cached := (← cache.get)[p]? then return cached
-  let metadata ← try some <$> p.symlinkMetadata catch
-    | .noFileOrDirectory .. => pure none
-    | e => throw e
-  let component ← if metadata.any (·.type == .symlink) then
-      pure (.symlink (← workspaceLinkTarget p))
-    else if Platform.isWindows then pure (.path (← resolvePath p))
-    else pure (.path p)
-  cache.modify (·.insert p component)
-  return component
-
 /-- Split an absolute path at its root, preserving Windows drive letters and UNC shares. -/
 private def rootParts (p : FilePath) : FilePath × List String :=
   let parts := p.components
@@ -116,9 +116,46 @@ private def rootParts (p : FilePath) : FilePath × List String :=
     | [] => (⟨"\\"⟩, [])
   else (⟨"/"⟩, parts.drop 1)
 
+/-- Resolve a spelling variant only when the filesystem identifies a single entry.
+Different cache symlinks can point to the same worktree at different locked revisions. -/
+private def alternateCheckout (repos : Repositories) (path : FilePath) : IO (Option FilePath) := do
+  let some candidates := repos.folded[path.toString.toLower]? | return none
+  let some parent := path.parent | return none
+  let name := path.fileName.getD ""
+  let siblings ← parent.readDir
+  unless siblings.countP (fun entry => entry.fileName.toLower == name.toLower) == 1 do return none
+  let mut matched := none
+  for alias in candidates do
+    unless alias.parent == path.parent && (← alias.symlinkMetadata.toBaseIO).isOk do continue
+    if let some other := matched then
+      let current ← IO.ofExcept repos.exact[alias]!
+      let previous ← IO.ofExcept repos.exact[other]!
+      if current != previous then throw <| IO.userError s!"Multiple revisions are locked for the checkout at {path}."
+    matched := some alias
+  return matched
+
+private def workspaceComponent (repos : Repositories) (cache : PrefixCache) (p : FilePath) : IO WorkspaceComponent := do
+  if let some cached := (← cache.get)[p]? then return cached
+  let metadata ← try some <$> p.symlinkMetadata catch
+    | .noFileOrDirectory .. => pure none
+    | e => throw e
+  let component ← match metadata with
+    | none => pure (.path p)
+    | some info => do
+      if info.type == .symlink then
+        if let some alias ← alternateCheckout repos p then pure (.path alias)
+        else pure (.symlink (← workspaceLinkTarget p))
+      else
+        -- realPath can restore on-disk casing and Unicode spelling on macOS and Windows.
+        let resolved ← IO.FS.realPath p
+        if repos.exact.contains resolved then pure (.path resolved)
+        else pure (.path ((← alternateCheckout repos resolved).getD resolved))
+  cache.modify (·.insert p component)
+  return component
+
 private def enterCheckout (repos : Repositories) (alias : FilePath) (q : DirectoryQuery α) :
     IO (DirectoryQuery α × Option Checkout) := do
-  let checkout ← IO.ofExcept repos[alias]!
+  let checkout ← IO.ofExcept repos.exact[alias]!
   let some suffix := GitTree.relativeTo? alias q.path
     | throw <| IO.userError s!"{q.path} leaves the locked repository {alias}"
   let path := if suffix.isEmpty then checkout.repo else checkout.repo / suffix
@@ -129,8 +166,9 @@ private def enterCheckout (repos : Repositories) (alias : FilePath) (q : Directo
 private def locatePath (repos : Repositories) (cache : PrefixCache) (q : DirectoryQuery α) :
     IO (DirectoryQuery α × Option Checkout) := do
   if let some repo := q.gitRepo then return ← enterCheckout repos repo q
+  if let some checkout := q.origin then return (q, some checkout)
   let p := q.path
-  if repos.isEmpty then return ({q with path := ← resolvePath p}, none)
+  if repos.exact.isEmpty then return ({q with path := ← resolvePath p}, none)
   let (root, parts) := rootParts p
   let mut dir := root
   let mut rest := parts
@@ -141,9 +179,9 @@ private def locatePath (repos : Repositories) (cache : PrefixCache) (q : Directo
     if part == ".." then
       unless ← dir.isDir do throw <| IO.userError s!"Expected a directory before '..' at {dir}"
     let next := appendComponent dir part
-    if repos.contains next then dir := next
+    if repos.exact.contains next then dir := next
     else
-      match ← workspaceComponent cache next with
+      match ← workspaceComponent repos cache next with
       | .path resolved => dir := resolved
       | .symlink target =>
         if links >= 40 then throw <| IO.userError s!"Too many workspace symlinks at {next}"
@@ -157,7 +195,7 @@ private def locatePath (repos : Repositories) (cache : PrefixCache) (q : Directo
         continue
     let mut ancestor := dir
     repeat
-      if repos.contains ancestor then
+      if repos.exact.contains ancestor then
         let path := tail.foldl (fun path (part : String) => path / part) dir
         return ← enterCheckout repos ancestor {q with path, workspaceLinks := links}
       -- Windows realPath can resolve an entire link target inside a repository at once.
@@ -181,7 +219,7 @@ private def readPackage (p : Located) (project : FilePath) (repo : Option FilePa
   let mut issues := issues
   let mut pin := none
   try
-    pin ← packagePin p.checkout (repo.getD project) project repo.isSome readText
+    pin ← packagePin p.path (repo.getD project) project repo.isSome readText
     if pin.isNone then
       issues := issues.push ("unknown_toolchain", "No lean-toolchain file was found for this package.")
   catch e =>
@@ -189,7 +227,7 @@ private def readPackage (p : Located) (project : FilePath) (repo : Option FilePa
   let obs : Observation := { toLocated := p, pin, issues }
   let some manifest := p.entry.manifestFile | return { obs with issues := issues.push (
     "missing_manifest", "The root lock records no package manifest to inspect for dependency pins.") }
-  let file := p.checkout / manifest
+  let file := p.path / manifest
   try
     let some contents ← readText file | return { obs with issues := issues.push (
       "missing_manifest", s!"Dependency pins are unknown because {manifest} is missing.") }
@@ -198,17 +236,26 @@ private def readPackage (p : Located) (project : FilePath) (repo : Option FilePa
   catch e => return { obs with issues := issues.push ("invalid_manifest", s!"Cannot inspect the package manifest: {e}") }
 
 private def missing (p : Located) : Observation :=
-  problem p "missing_checkout" s!"Package directory is missing: {p.checkout}"
+  problem p "missing_checkout" s!"Package directory is missing: {p.path}"
 
-private structure Directory where
-  path : FilePath
+private structure Directory extends SourcePath where
   repo : Option FilePath := none
   readText : ReadText := fileText?
-  committed : Bool := false
   issues : Array Issue := #[]
 
 private abbrev Inspect (α β : Type) := DirectoryQuery α → Except Issue Directory → IO β
 private abbrev BatchResult (α β : Type) := Sum (DirectoryQuery α) β
+
+/-- Packages in one committed tree often inherit a toolchain from a common ancestor.
+Cache both present and absent pins for the batch without retaining package manifests. -/
+private def cacheToolchains (readText : ReadText) : IO ReadText := do
+  let pins ← IO.mkRef (∅ : Std.HashMap FilePath (Option String))
+  return fun path => do
+    if path.fileName != some "lean-toolchain" then return ← readText path
+    if let some pin := (← pins.get)[path]? then return pin
+    let pin ← readText path
+    pins.modify (·.insert path pin)
+    return pin
 
 private def inspectGit (repo : FilePath) (revision : String) (env : GitTree.Env)
     (group : Array (DirectoryQuery α)) (inspect : Inspect α β) : IO (Array (BatchResult α β)) := do
@@ -237,15 +284,17 @@ private def inspectGit (repo : FilePath) (revision : String) (env : GitTree.Env)
         if head.isNone then return none
         return some (← group.mapM fun q => finish q (.error issue))
       group := group.map fun q => if q.issues.contains issue then q else { q with issues := q.issues.push issue }
+    let readText := git.readText? commit
+    let readText ← if group.size > 1 then cacheToolchains readText else pure readText
     let results ← group.mapM fun q => do
       match ← (git.directoryOrExit commit q.path).toBaseIO with
       | .error e => finish q (.error ("unknown_package_directory", toString e))
       | .ok (.inside path) =>
-        finish q (.ok { path, repo := some repo, readText := git.readText? commit, committed := true })
+        finish q (.ok { path, origin := some ⟨repo, commit⟩, repo := some repo, readText })
       | .ok (.outside remaining) =>
         if q.gitRepo.isSome then
           return ← finish q (.error ("unknown_package_directory", s!"{q.path} leaves the locked repository"))
-        return .inl {q with path := remaining}
+        return .inl {q with path := remaining, origin := none}
     return some results).toBaseIO
   if let .ok (some results) := batch then return results
   fallback ()
@@ -281,14 +330,14 @@ private def inspectDirectories (repos : Repositories) (env : GitTree.Env)
   return results
 
 private abbrev Observations := Std.TreeMap String Observation
-private abbrev SourcePaths := Std.HashMap FilePath (Except Issue FilePath)
+private abbrev SourcePaths := Std.HashMap SourcePath (Except Issue SourcePath)
 
 /-- A cache entry may link to a working tree that local path dependencies also name directly.
     Both spellings must use the locked commit. An explicit cache name disambiguates different
     revisions of one working tree; a physical path alone cannot. -/
 private def repositories (packagesDir : FilePath) (lock : Lock) : IO Repositories := do
-  let mut physical : Repositories := ∅
-  let mut entries : Repositories := ∅
+  let mut physical : RepoMap := ∅
+  let mut entries : RepoMap := ∅
   for (name, pkg) in lock.packages do
     if let .git _ rev .. := pkg.source then
       let entry := packagesDir / name
@@ -301,7 +350,10 @@ private def repositories (packagesDir : FilePath) (lock : Lock) : IO Repositorie
           | some (.ok prior) => if prior == checkout then .ok checkout else
               .error s!"Multiple revisions are locked for the checkout at {repo}."
           | some (.error e) => .error e
-  return if physical.isEmpty then entries else physical.insertMany entries
+  let exact := if physical.isEmpty then entries else physical.insertMany entries
+  let folded := exact.fold (init := ∅) fun (m : Std.HashMap _ _) path _ =>
+    m.alter path.toString.toLower fun paths => some (path :: paths.getD [])
+  return {exact, folded}
 
 private def observe (project packages : FilePath) (lock : Lock) (repos : Repositories)
     (env : GitTree.Env) : IO (Observations × SourcePaths) := do
@@ -315,17 +367,19 @@ private def observe (project packages : FilePath) (lock : Lock) (repos : Reposit
       queries := queries.push {key := entry, path := if copy then packages / name else project / dir}
   let observations ← inspectDirectories repos env queries fun q result => do
     let obs ← match result with
-      | .error (kind, message) => pure (problem ⟨q.key, q.path⟩ kind message)
+      | .error (kind, message) => pure (problem ⟨q.toSourcePath, q.key⟩ kind message)
       | .ok dir => do
-        let p := ⟨q.key, dir.path⟩
-        let available ← if dir.committed then pure true else dir.path.isDir
+        let p := ⟨dir.toSourcePath, q.key⟩
+        let available ← if dir.origin.isSome then pure true else dir.path.isDir
         if available then readPackage p project dir.repo dir.readText dir.issues else pure (missing p)
-    return ({obs with issues := q.issues ++ obs.issues}, result.map (·.path))
+    return ({obs with issues := q.issues ++ obs.issues}, result.map (·.toSourcePath))
   let mut packages := ∅
   let mut sources := ∅
   for (obs, path) in observations do
     packages := packages.insert obs.entry.name obs
-    if let .path dir false := obs.entry.source then sources := sources.insert (project / dir) path
+    if let .path dir false := obs.entry.source then sources := sources.insert {path := project / dir} path
+    if let .ok resolved := path then
+      if resolved.origin.isSome then sources := sources.insert resolved (.ok resolved)
   return (packages, sources)
 
 /-- Breadth-first search with sorted neighbors for stable shortest paths. Each child
@@ -355,19 +409,19 @@ private def sameRemote (a b : String) : Bool :=
 
 private def sourcePaths (project : FilePath) (repos : Repositories) (env : GitTree.Env)
     (observations : Observations) (known : SourcePaths) : IO SourcePaths := do
-  let mut requested : Std.HashSet FilePath := ∅
+  let mut requested : Std.HashSet SourcePath := ∅
   for (_, parent) in observations do
     for (child, wanted) in parent.edges do
       let some selected := observations[child]? | continue
       if let .path dir _ := wanted.source then
         if let .path rootDir _ := selected.entry.source then
-          let left := parent.checkout / dir
-          let right := project / rootDir
+          let left := parent.toSourcePath.join dir
+          let right := {path := project / rootDir : SourcePath}
           if left != right then
             unless known.contains left do requested := requested.insert left
             unless known.contains right do requested := requested.insert right
-  let resolved ← inspectDirectories repos env (requested.toArray.map fun path => {key := path, path})
-    fun q result => pure (q.key, result.map (·.path))
+  let resolved ← inspectDirectories repos env (requested.toArray.map fun source => {key := source, toSourcePath := source})
+    fun q result => pure (q.key, result.map (·.toSourcePath))
   return resolved.foldl (init := known) fun m (key, path) => m.insert key path
 
 private def conflict (parent : Observation) (wanted selected : LockedPackage) (project : FilePath)
@@ -382,12 +436,17 @@ private def conflict (parent : Observation) (wanted selected : LockedPackage) (p
     if Source.directoryKey (sub.getD "") != Source.directoryKey (rootSub.getD "") then
       return some ("source_conflict", s!"{name} and the root select different package subdirectories at the same revision.")
   | .path dir _, .path rootDir _ =>
-    let requested := parent.checkout / dir
-    let actual := project / rootDir
+    let requested := parent.toSourcePath.join dir
+    let actual := {path := project / rootDir : SourcePath}
     if requested == actual then return none
     match sources[requested]!, sources[actual]! with
     | .ok requested, .ok actual =>
-      if requested != actual then return some ("source_conflict", s!"{name} locks path {requested}. The root locks {actual}.")
+      if requested != actual then
+        let describe := fun (s : SourcePath) =>
+          if requested.path == actual.path then
+            s.origin.elim s!"{s.path} in the working tree" (fun c => s!"{s.path} at {c.revision}")
+          else s.path.toString
+        return some ("source_conflict", s!"{name} locks path {describe requested}. The root locks {describe actual}.")
     | .error (_, message), _ | _, .error (_, message) => return some ("unknown_path_source", message)
   | .path .., .git .. => return some ("source_conflict", s!"{name} locks a path source. The root locks a git source.")
   | .git .., .path .. => return some ("source_conflict", s!"{name} locks a git source. The root locks a path source.")
@@ -401,7 +460,7 @@ private def inventory (p : Observation) (path : List String) : Json :=
     ("name", p.entry.name), ("toolchain", toJson (p.pin.map Prod.fst)),
     ("toolchain_source", toJson (p.pin.map Prod.snd)), ("revision", toJson p.entry.source.revision?),
     ("url", toJson url), ("scope", p.entry.scope), ("sub_dir", toJson subDir), ("input_rev", toJson inputRev),
-    ("checkout", p.checkout.toString), ("direct", toJson (!p.entry.inherited)), ("type", kind),
+    ("checkout", p.path.toString), ("direct", toJson (!p.entry.inherited)), ("type", kind),
     ("fixed_toolchain", toJson p.fixedToolchain), ("path", toJson path), ("path_known", toJson (!path.isEmpty))]
 
 private def finding (name : String) (path : List String) (issue : Issue) : Json :=
@@ -424,7 +483,7 @@ def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Jso
   let packagesDir ← resolvePath (lock.packagesDir.elim (lakeDir / "packages") (project / ·))
   let rootPin ← pin? project fileText?
   let repos ← repositories packagesDir lock
-  let env ← if repos.isEmpty then pure #[] else GitTree.environment
+  let env ← if repos.exact.isEmpty then pure #[] else GitTree.environment
   let (observations, known) ← observe project packagesDir lock repos env
   let paths := shortestPaths root observations
   let sources ← sourcePaths project repos env observations known

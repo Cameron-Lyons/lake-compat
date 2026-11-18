@@ -1,4 +1,5 @@
 import Init.Data.String.Lossy
+import Init.Data.String.FindPos
 import Std.Internal.UV.System
 import Std.Sync.Mutex
 
@@ -40,12 +41,20 @@ private def Excerpt.append (log : Excerpt) (block : ByteArray) : Excerpt := Id.r
   let diagnostic := if log.diagnostic.isEmpty then scrollingDiagnostic bytes overflow else log.diagnostic
   return { tail := bytes.extract overflow bytes.size, diagnostic }
 
+/-- Keep complete characters within the report's UTF-8 byte budget. Decoding an invalid
+byte into the replacement character can increase the number of bytes in a build log. -/
+def boundedLogTail (message : String) (limit := logLimit) : String := Id.run do
+  if message.utf8ByteSize ≤ limit then return message
+  let start := message.posGE ⟨message.utf8ByteSize - limit⟩ (Nat.sub_le ..)
+  return (message.sliceFrom start).copy
+
 private def Excerpt.text (log : Excerpt) : String := Id.run do
-  let omitted := "\n[... output omitted ...]\n".toUTF8
-  let bytes := if log.diagnostic.isEmpty then log.tail else
-    let keep := logLimit - omitted.size - log.diagnostic.size
-    log.diagnostic ++ omitted ++ log.tail.extract (log.tail.size - keep) log.tail.size
-  return (String.fromUTF8Lossy bytes).trimAscii.copy
+  let tail := String.fromUTF8Lossy log.tail
+  let excerpt := if log.diagnostic.isEmpty then boundedLogTail tail else
+    let diagnostic := String.fromUTF8Lossy log.diagnostic
+    let omitted := "\n[... output omitted ...]\n"
+    diagnostic ++ omitted ++ boundedLogTail tail (logLimit - diagnostic.utf8ByteSize - omitted.utf8ByteSize)
+  return excerpt.trimAscii.copy
 
 private def readOutput (pipe : IO.FS.Handle) (log : Std.Mutex Excerpt) : IO Unit := do
   repeat

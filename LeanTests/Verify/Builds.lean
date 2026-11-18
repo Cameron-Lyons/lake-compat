@@ -28,6 +28,7 @@ private def customCache (target : String) : IO Unit := withProject fun project =
   write (project / "vendor/local/lakefile.toml") "name = \"local\"\n[[lean_lib]]\nname = \"Local\"\n"
   write (project / "vendor/local/Local.lean") "def localGreeting := \"local\"\n"
   write (project / "vendor/message.txt") "source data"
+  link "vendor" (project / "vendor-link")
   write (project / "lakefile.toml") (appConfig ++ "packagesDir = \"vendor\"\n" ++
     s!"[[require]]\nname = \"greeting\"\ngit = \"../greeting\"\nrev = \"{revision}\"\n" ++
     "[[require]]\nname = \"local\"\npath = \"vendor/local\"\n" ++ mainLibrary)
@@ -35,7 +36,7 @@ private def customCache (target : String) : IO Unit := withProject fun project =
     "example : (include_str \"vendor/message.txt\") = \"source data\" := rfl\n")
   let lock := project / "lake-manifest.json"
   let entries := #[gitEntry "greeting" "../greeting" revision,
-    pathEntry "base" "vendor/greeting/base" (inherited := true), pathEntry "local" "vendor/local"]
+    pathEntry "base" "vendor-link/greeting/base" (inherited := true), pathEntry "local" "vendor/local"]
   writeJson lock ((manifest entries).setObjVal! "packagesDir" "vendor")
   let original ← IO.FS.readBinFile lock
   let checkout := project / "vendor/greeting"
@@ -52,6 +53,14 @@ private def customCache (target : String) : IO Unit := withProject fun project =
       check ((← IO.FS.readFile (checkout / "Greeting.lean")) == "local edits\n") "changed working checkout"
     else
       check (!(← checkout.pathExists)) "created a checkout in the user's package cache"
+  -- Keep the lock spelling while the checkout and cache use another case on disk.
+  if ← (project / "VENDOR/GREETING").pathExists then
+    IO.FS.rename checkout (project / "vendor/Greeting")
+    IO.FS.rename (project / "vendor") (project / "Vendor")
+    let alternate := entries.set! 1 (pathEntry "base" "VENDOR/GREETING/base" (inherited := true))
+    writeJson lock ((manifest alternate).setObjVal! "packagesDir" "vendor")
+    expect (← trial project (target := target)) "passed"
+    check ((← IO.FS.readFile (checkout / "Greeting.lean")) == "local edits\n") "changed mixed-case checkout"
 
 private def copiedCache (target : String) : IO Unit := withProject fun project => do
   let source := project / "source"

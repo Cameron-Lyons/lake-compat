@@ -25,15 +25,14 @@ private def checkProject (project : FilePath) : IO Unit := do
     throw <| IO.userError s!"{project} has a Lake configuration but no lake-manifest.json. Run `lake update` in that directory to create the manifest, then retry."
   throw <| IO.userError (s!"No Lake configuration or lake-manifest.json found in {project}." ++ hint)
 
-private abbrev Pins := Std.TreeMap String String
-
-private def explicitPins (packages : Array Json) (revisions : Array (String × String)) : IO Pins := do
+private def explicitPins (packages : Array Json) (revisions : Array (String × String)) : IO Verify.Pins := do
   if revisions.isEmpty then return {}
   let git := packages.foldl (init := ({} : Std.HashSet String)) fun names pkg =>
     if Report.string pkg "type" == "git" then names.insert (Report.string pkg "name") else names
-  let mut pins : Pins := {}
-  for (name, sha) in revisions do
-    unless git.contains name do throw <| IO.userError s!"'{name}' is not a locked Git package"
+  let mut pins : Verify.Pins := {}
+  for (input, sha) in revisions do
+    let name := if git.contains input then input else (packageName input).toOption.getD input
+    unless git.contains name do throw <| IO.userError s!"'{input}' is not a locked Git package"
     if let some existing := pins.get? name then
       unless sha == existing do throw <| IO.userError s!"two different revisions supplied for '{name}'"
     pins := pins.insert name sha
@@ -48,7 +47,7 @@ private def lookupSuggestions (report : Json) : IO Json := do
     return (name, result)
   return Json.mkObj results.toList
 
-private def selectedPins (packages : Array Json) (suggestions : Json) (explicit : Pins) : Pins := Id.run do
+private def selectedPins (packages : Array Json) (suggestions : Json) (explicit : Verify.Pins) : Verify.Pins := Id.run do
   let mut pins := explicit
   for pkg in packages do
     let name := Report.string pkg "name"
@@ -80,7 +79,9 @@ private def scan (opts : Options) (project : FilePath) : IO Json := do
       report := report.setObjVal! "auto_selected" true
   if opts.verify || opts.trySuggested || !pins.isEmpty then
     let timeout := opts.buildTimeoutSeconds.getD defaultBuildTimeoutSeconds
-    let result ← verifyBuild project (Report.string report "target") pins.toArray (timeout * 1000) (some manifest)
+    let result ← verifyBuild project (Report.string report "target") pins.toArray (timeout * 1000)
+      (some manifest) opts.buildTargets
+    if !opts.buildTargets.isEmpty then report := report.setObjVal! "build_targets" (toJson opts.buildTargets)
     report := (report.setObjVal! "verification" result).setObjVal! "trial_revisions"
       (Json.mkObj (pins.toList.map fun (k, v) => (k, .str v)))
   return if opts.demo then displayDemo project report else report

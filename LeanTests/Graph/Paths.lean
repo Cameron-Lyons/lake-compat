@@ -33,8 +33,10 @@ private def sharedCheckout (project : FilePath) : IO Unit := do
   let second ← git repo #["rev-parse", "HEAD"]
   IO.FS.createDirAll (packagesDir project)
   for name in ["older", "newer"] do link (packagesDir project / name) repo
+  let olderDir := if ← (packagesDir project / "OLDER").isDir then ".LAKE/Packages/OLDER/child"
+                  else ".lake/packages/older/child"
   manifest project #[gitDep "older" first, gitDep "newer" second,
-    localDep "ambiguous" "shared/child", localDep "explicit" ".lake/packages/older/child"]
+    localDep "ambiguous" "shared/child", localDep "explicit" olderDir]
   let r ← report project
   expectField (← pkg r "older") "toolchain" older
   expectField (← pkg r "explicit") "toolchain" older
@@ -42,6 +44,46 @@ private def sharedCheckout (project : FilePath) : IO Unit := do
   expectField (← pkg r "ambiguous") "toolchain" .null
   check ((findings r).any fun f => str f "package" == "ambiguous" && str f "kind" == "unknown_package_directory")
     r.compress
+
+private def checkoutSpelling (project : FilePath) : IO Unit := do
+  let repo := packagesDir project / "ParÉnt"
+  manifest repo
+  pin repo
+  manifest (repo / "child")
+  pin (repo / "child") "4.24.0"
+  let revision ← commitMetadata repo
+  pin (repo / "child")
+  let source := ".LAKE/Packages/parént/child"
+  let alias := project / source
+  let insensitive ← alias.isDir
+  unless insensitive do
+    -- A differently spelled directory can designate independent working sources.
+    manifest alias
+    pin alias
+  manifest project #[gitDep "ParÉnt" revision, localDep "child" source]
+  let r ← report project
+  expectField (← pkg r "child") "toolchain" (if insensitive then older else target)
+
+private def relativeSourceAtRevision (project : FilePath) : IO Unit := do
+  let repo := project / "shared"
+  manifest repo #[localDep "child" "child"]
+  manifest (repo / "child")
+  pin repo
+  let first ← commitMetadata repo
+  pin (repo / "child") "4.24.0"
+  discard <| git repo #["add", "."]
+  discard <| git repo #["commit", "-qm", "change the child toolchain"]
+  let second ← git repo #["rev-parse", "HEAD"]
+  IO.FS.createDirAll (packagesDir project)
+  for name in ["older", "newer"] do link (packagesDir project / name) repo
+  manifest project #[gitDep "older" first, gitDep "newer" second,
+    localDep "child" ".lake/packages/older/child" true]
+  let r ← report project
+  -- Both parents request the same physical directory, each at its own locked commit.
+  let edges := (findings r).filter fun f => !(str f "parent").isEmpty
+  expect (edges.map fun f => (str f "parent", str f "kind")) #[("newer", "source_conflict")]
+  let message := str edges[0]! "message"
+  for rev in [first, second] do check (message.contains rev) message
 
 private def untraversablePrefix (project : FilePath) : IO Unit := do
   manifest (project / "child")
@@ -199,6 +241,8 @@ private def staleCommit (project : FilePath) : IO Unit := do
 def run : IO Unit := do
   runCase "physical and symlinked Git checkout" physicalAlias
   runCase "ambiguous shared checkout" sharedCheckout
+  runCase "case-sensitive and case-insensitive checkout spellings" checkoutSpelling
+  runCase "relative requirements at shared checkout revisions" relativeSourceAtRevision
   runCase "nontraversable parent component" untraversablePrefix
   runCase "external committed links" externalCommittedLinks
   runCase "pin inherited at committed link destination" lockedDestination

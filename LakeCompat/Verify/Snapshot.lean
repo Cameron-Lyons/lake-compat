@@ -16,6 +16,15 @@ def metadata? (p : FilePath) : IO (Option IO.FS.Metadata) := do
 
 private def excluded (component : String) := component == ".git" || component == ".lake"
 
+/-- Walk cache components without following links. The OS can return a different spelling
+for a real directory on a case-insensitive filesystem. -/
+def isolatedDirectory (root relative : FilePath) : IO (Option FilePath) := do
+  let mut path := root
+  for part in relative.components do
+    path := path / part
+    unless (← metadata? path).any (·.type == .dir) do return none
+  return some (← IO.FS.realPath path)
+
 /-- Resolve each component of a copied symlink so even an intermediate escape followed by ".."
 is rejected. The snapshot has stopped changing before links are inspected. -/
 private def linkTarget (root link : FilePath) : IO FilePath := do
@@ -86,7 +95,9 @@ def sourceByteLimit := 1024 ^ 3
 def copySources (source destination : FilePath) (packagesDir : FilePath := ".lake/packages")
     (managedPackages : Std.HashSet String := ∅) : IO Unit := do
   if isInside source destination then throw <| IO.userError "The temporary directory must be outside the project."
-  let packageCache := source / packagesDir
+  let packageCache ← if managedPackages.isEmpty then pure none else isolatedDirectory source packagesDir
+  let foldedNames := managedPackages.fold (init := (∅ : Std.HashMap String String)) fun m name =>
+    m.insert name.toLower name
   IO.FS.createDir destination
   let mut stack := #[(source, destination)]
   let mut totalBytes := 0
@@ -95,8 +106,20 @@ def copySources (source destination : FilePath) (packagesDir : FilePath := ".lak
     stack := stack.pop
     let mut files := #[]
     let mut argBytes := 0
-    for entry in ← dir.readDir do
-      if excluded entry.fileName || (dir == packageCache && managedPackages.contains entry.fileName) then continue
+    let inCache := packageCache == some dir
+    let entries ← dir.readDir
+    let onDisk : Thunk (Std.HashSet String) := Thunk.mk fun _ =>
+      entries.foldl (init := ∅) fun names e => names.insert e.fileName
+    let cacheNames := if inCache then foldedNames else ∅
+    for entry in entries do
+      if excluded entry.fileName || (inCache && managedPackages.contains entry.fileName) then continue
+      if inCache || entry.fileName.startsWith "." then
+        let lower := entry.fileName.toLower
+        let spelling := if excluded lower then some lower else cacheNames[lower]?
+        if let some spelling := spelling then
+          -- Distinct spellings can coexist on a case-sensitive filesystem. Check the source
+          -- lookup before treating an entry as an alternative spelling of an excluded name.
+          if !onDisk.get.contains spelling && (← metadata? (dir / spelling)).isSome then continue
       if batches.size >= 16 then
         copyBatches batches
         batches := #[]

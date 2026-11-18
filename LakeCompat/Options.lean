@@ -10,7 +10,8 @@ Explain which locked dependencies need attention for a Lean upgrade.
   --project DIR            Read lake-manifest.json here (default: current directory)
   --demo                   Scan the bundled example project
   --suggest                Look up candidate revisions on Reservoir
-  --verify                 Build the locked project with the installed target
+  --verify                 Build the project's default targets on this toolchain
+  --build-target NAME      Build a named Lake target; repeat to build several
   --try-suggested          Build a trial with each package's top candidate
   --try-revision NAME=SHA  Try a full Git commit; repeat to combine changes
   --build-timeout SECONDS  Time allowed for lake build (default: 600 seconds)
@@ -24,12 +25,27 @@ structure Options where
   demo : Bool := false
   suggest : Bool := false
   verify : Bool := false
+  buildTargets : Array String := #[]
   trySuggested : Bool := false
   revisions : Array (String × String) := #[]
   buildTimeoutSeconds : Option Nat := none
   json : Bool := false
   strict : Bool := false
   deriving Inhabited
+
+/-- Qualify named targets so a bare name always selects a target in the root package.
+An explicit package and a facet (e.g. @dep/+Mod:olean) are also accepted. -/
+def buildTargetSpec (value : String) : Except String String := do
+  let invalid := "--build-target expects a target name such as MyLib or @package/MyLib"
+  if value.trimAscii.isEmpty || value.startsWith "-" || value.any (· < ' ') then throw invalid
+  let (pkg, target) ← match value.splitOn "/" with
+    | [name] => do
+      if name.startsWith "@" then throw invalid
+      pure ("", name)
+    | [pkg, name] => pure ((pkg.dropPrefix "@").copy, name)
+    | _ => throw invalid
+  if target.isEmpty || target.startsWith ":" || (target.splitOn ":").length > 2 || pkg.contains ':' then throw invalid
+  return s!"@{pkg}/{target}"
 
 private def parsePin (value : String) : Except String (String × String) := do
   let expected := "--try-revision expects PACKAGE=SHA with a full 40- or 64-character Git commit"
@@ -50,6 +66,9 @@ private def optionValue (opts : Options) (flag value : String) : Except String O
     if value.isEmpty then throw "--project requires a directory"
     return {opts with project := some value}
   | "--try-revision" => return {opts with revisions := opts.revisions.push (← parsePin value)}
+  | "--build-target" =>
+    discard <| buildTargetSpec value
+    return {opts with verify := true, buildTargets := opts.buildTargets.push value}
   | "--build-timeout" =>
     let some seconds := value.toNat?.filter (· > 0)
       | throw "--build-timeout expects a positive integer in seconds"
@@ -70,7 +89,7 @@ def parseOptions (args : List String) : Except String Options := do
     else
       match arg with
       | "--" => positionalOnly := true
-      | "--project" | "--try-revision" | "--build-timeout" => pending := some arg
+      | "--project" | "--try-revision" | "--build-target" | "--build-timeout" => pending := some arg
       | "--demo" => opts := {opts with demo := true}
       | "--suggest" => opts := {opts with suggest := true}
       | "--verify" => opts := {opts with verify := true}

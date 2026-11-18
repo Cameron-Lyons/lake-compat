@@ -143,6 +143,22 @@ private def testFailures : IO Unit := do
       pure (if req == endpoint then metadata else if req.endsWith "/versions" then dataRows #[] else bad))
     check (status report == "unavailable") "malformed records must not produce no_match"
 
+private def testRegistryResponses : IO Unit := do
+  let lookup := fun (pkg versions builds : Json) =>
+    suggestVersions url target (some "mathlib") (fetch := fun req =>
+      pure (if req == endpoint then pkg else if req.endsWith "/versions" then versions else builds))
+  let versions := #[version (rev 'a') (some "v1")]
+  let builds := #[build (rev 'b')]
+  let expected ← lookup metadata (dataRows versions) (dataRows builds)
+  let alternative ← lookup (Json.mkObj [("data", metadata)]) (.arr versions) (.arr builds)
+  check (status alternative == "found" && alternative == expected)
+    "bare and wrapped registry payloads must return the same candidates"
+  let absent := Json.mkObj [("error", Json.mkObj [("status", 404), ("message", "package absent")])]
+  let report ← lookup metadata (.arr versions) absent
+  check (status report == "found" && report.getObjValD "unavailable_history" == "builds" &&
+    (rows report)[0]!.getObjValD "evidence" == "declared")
+    "an API error envelope must preserve independent version evidence"
+
 private def testPartialHistory : IO Unit := do
   let lookup := fun (versions builds : Except RegistryError Json) =>
     suggestVersions url target (some "mathlib") (fetch := fun req =>
@@ -170,6 +186,7 @@ def run : IO Unit := do
   testTiedEvidence
   testIdentity
   testFailures
+  testRegistryResponses
   testPartialHistory
 
 end LeanTests.Releases

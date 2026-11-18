@@ -91,6 +91,11 @@ private def fakeBuild (scenario : String) (project : FilePath) : IO UInt32 := do
   | "tail" =>
     IO.println (String.ofList (List.replicate 24000 'a') ++ " ERROR at Main.lean:3")
     return 2
+  | "binary-log" =>
+    let out ← IO.getStdout
+    out.write ⟨Array.replicate 18000 0xff⟩
+    out.putStr " build failed"
+    return 1
   | "diagnostic" =>
     IO.print (String.join (List.replicate 2000 "Resolved dependency\n"))
     IO.println "error: ./Main.lean:3:8: Type mismatch\n  expected Nat"

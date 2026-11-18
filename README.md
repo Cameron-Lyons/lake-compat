@@ -1,6 +1,6 @@
 # lake-compat
 
-Find the dependency that needs attention before upgrading a Lean 4 project. Given a target toolchain, `lake-compat` traces conflicting pins back to the package that requested them. It can look up alternative revisions and build your project's default Lake targets with them. Use `--json` for the full package inventory and dependency paths.
+Find the dependency that needs attention before upgrading a Lean 4 project. Given a target toolchain, `lake-compat` traces conflicting pins back to the package that requested them. It can look up alternative revisions and build your project's Lake targets with them. Use `--json` for the full package inventory and dependency paths.
 
 ## Build and run
 
@@ -36,13 +36,16 @@ For example, in the Lean RealWorld application, `realworld -> jose -> json` iden
 | --- | --- |
 | `lake-compat 4.36.0 --suggest` | Look up alternative revisions for flagged Git packages and the parents involved in conflicts. |
 | `lake-compat 4.36.0 --verify` | Build the current locked revisions using the target toolchain. |
+| `lake-compat 4.36.0 --build-target MyLib --build-target MyExe` | Build both named targets in one trial. This also works for projects with no default targets. |
 | `lake-compat 4.36.0 --try-suggested` | Pick the top candidate for each package with a match and build that combination in a temporary copy. Packages without candidates keep their current pins. |
 | `lake-compat 4.36.0 --try-revision "Cli=$CLI_COMMIT"` | Test a specific full Git SHA. Repeat the option to test several changes together. Explicit choices take precedence over automatic choices. |
 | `lake-compat 4.36.0 --json --strict` | Produce a machine-readable metadata report suitable for CI. |
 
 Suggestions use `curl` to query Reservoir for indexed GitHub repositories. The lookup checks the package's repository, subdirectory, and exact target toolchain. It prefers successful recorded builds and flags any that required a dependency update. It also lists revisions that declare the target when build evidence is unavailable. If only one history can be retrieved, the report labels each candidate with its available evidence. In JSON, `unavailable_history` identifies the missing `builds` or `versions` history. A lookup with incomplete history and no candidates is reported as unavailable. [Reservoir](https://reservoir.lean-lang.org/)
 
-Build trials require Git, a POSIX host, and the target already installed in elan. For example, `elan toolchain install leanprover/lean4:v4.36.0` makes that toolchain available. A trial copies the working source, including uncommitted project edits, into a temporary directory, sets the target and selected pins there, and runs the default Lake build. Lake can fetch dependencies and execute project and dependency build scripts with your permissions. Git dependencies come from the locked commits. A relative Git URL such as `../greeting` is resolved from the original project so the trial can fetch the same local repository. The root snapshot omits `.git` and Lake caches, so a build step that needs the root repository's history can fail in the trial.
+Build trials require Git, a POSIX host, and the target already installed in elan. For example, `elan toolchain install leanprover/lean4:v4.36.0` makes that toolchain available. A trial copies the working source, including uncommitted project edits, into a temporary directory, sets the toolchain and selected pins there, and runs Lake. By default it builds the project's default targets. Each `--build-target` selects a named target for that trial. A bare name selects a target in the root package. Use `@package/Name` for a dependency target or `@package/+Module:olean` for a module facet. You can combine these selections with `--try-revision` or `--try-suggested`. The JSON field `build_targets` records explicit selections.
+
+Lake can fetch dependencies and execute project and dependency build scripts with your permissions. Git dependencies come from the locked commits. A relative Git URL such as `../greeting` is resolved from the original project so the trial can fetch the same local repository. The root snapshot omits `.git` and Lake caches, so a build step that needs the root repository's history can fail in the trial.
 
 The trial starts from the lock used for the metadata scan. If that lock changes before the snapshot, verification reports an inconclusive result. A successful trial checks that Lake retained the trial manifest and toolchain and that the resulting Git checkouts match every expected revision. With `--json`, `trial_revisions` lists requested changes and `verification.checked_revisions` records the full set of Git pins in a passing build. To adopt a passing trial, update `lean-toolchain` and the relevant requirements in your project's `lakefile.toml` or `lakefile.lean`, regenerate the manifest with Lake, and verify the resulting lock.
 

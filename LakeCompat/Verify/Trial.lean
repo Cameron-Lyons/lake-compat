@@ -118,6 +118,14 @@ survive trial revision edits. -/
 def loadTrial (project : FilePath) (revisions : Pins) : IO Trial := do
   return (← readTrial project revisions).1
 
+/-- The manifest exists. A second spelling that resolves without a separate directory entry
+distinguishes a case-insensitive workspace. -/
+private def hasCaseAliases (root : FilePath) : IO Bool := do
+  let upper := manifestName.toUpper
+  unless (← metadata? (root / upper)).isSome do return false
+  let entries ← root.readDir
+  return !(entries.any (·.fileName == manifestName) && entries.any (·.fileName == upper))
+
 /-- Read the cache location before copying and confirm the copied lock matches this input.
 Only real directories may lead to the freshly materialized checkouts. -/
 def prepareTrial (project workspace : FilePath) (revisions : Pins) (configuredDir : IO FilePath)
@@ -131,6 +139,8 @@ def prepareTrial (project workspace : FilePath) (revisions : Pins) (configuredDi
   copySources project workspace trial.packagesDir managed
   if (← IO.FS.readFile (workspace / manifestName)) != contents then
     throw <| IO.userError "The project manifest changed while taking the source snapshot."
+  if (← hasCaseAliases workspace) then
+    discard <| IO.ofExcept <| packageCacheDir trial.packagesDir.toString.toLower
   let mut cachePrefix := workspace
   for part in trial.packagesDir.components do
     cachePrefix := cachePrefix / part
@@ -141,40 +151,58 @@ def prepareTrial (project workspace : FilePath) (revisions : Pins) (configuredDi
       throw <| IO.userError s!"Cannot isolate the managed package directory for {name}."
   return trial
 
+/-- Preserve the spelling and symlink resolution of the existing prefix. The rest of a path
+into a managed checkout may only exist once Lake fetches it. -/
+private def resolveExistingPrefix (root relative : FilePath) : IO FilePath := do
+  let mut path := root
+  let mut resolving := true
+  for part in relative.components do
+    path := path / part
+    if resolving then
+      resolving := (← metadata? path).isSome
+      if resolving then path ← IO.FS.realPath path
+  return path
+
 def Trial.checkLocalPaths (trial : Trial) (root : FilePath) (materialized : Bool) : IO Unit := do
-  let cacheParts := trial.packagesDir.components
   if materialized then
     for (name, subDir) in trial.gitSubDirs do
       let checkout := root / trial.packagesDir / name
       let package := checkout / subDir
       if ← package.isDir then
-        if isInside checkout (← IO.FS.realPath package) then continue
+        if isInside (← IO.FS.realPath checkout) (← IO.FS.realPath package) then continue
       throw <| IO.userError s!"The package directory {subDir} for {name} must resolve to a directory in its locked checkout."
     for name in trial.copiedPackages do
-      let destination := root / trial.packagesDir / name
-      if (← metadata? destination).any (·.type == .dir) then
-        if (← IO.FS.realPath destination) == destination then continue
+      if (← isolatedDirectory root (trial.packagesDir / name)).isSome then continue
       throw <| IO.userError s!"Lake did not materialize an isolated copy of {name} at {trial.packagesDir / name}."
-  let managedOwner? := fun (parts : List String) => do
-    guard (cacheParts.isPrefixOf parts)
-    let name ← parts[cacheParts.length]?
-    guard (trial.pins.contains name || trial.copiedPackages.contains name)
-    return name
+  if trial.paths.isEmpty then return
+  let foldCase ← hasCaseAliases root
+  let key := fun (s : String) => if foldCase then s.toLower else s
+  let managed := trial.pins.foldl (init := trial.copiedPackages) fun names name _ => names.insert name
+  let names := managed.fold (init := (∅ : Std.HashMap String String)) fun map name => map.insert (key name) name
+  let cache ← resolveExistingPrefix root trial.packagesDir
+  let physicalParts := cache.components.map key
+  let cacheParts := trial.packagesDir.components.map key
+  let owner? := fun (base path : List String) => do
+    guard (base.isPrefixOf path)
+    names[← path[base.length]?]?
   for (name, path) in trial.paths do
-    let components := parts path
+    let components := (parts path).map key
     if components.contains ".git" then throw <| IO.userError s!"{name} references a Git metadata directory."
-    let normalized := (← IO.ofExcept <| normalParts path).toList
+    let normalized := (← IO.ofExcept <| normalParts path).toList.map key
     -- A symlink inside a fetched checkout can change the interpretation of a following '..'.
-    let owners := [managedOwner? components, managedOwner? normalized].filterMap id
+    let mut owners := [owner? cacheParts components, owner? cacheParts normalized].filterMap id
+    if !managed.isEmpty && owners.isEmpty then
+      let physical ← resolveExistingPrefix root path
+      owners := (owner? physicalParts (physical.components.map key)).toList
     if !owners.isEmpty then
       unless materialized do continue
     else if components.contains ".lake" then
       throw <| IO.userError s!"{name} has a cache path outside the materialized packages."
     let resolved ← IO.FS.realPath (root / path)
-    if trial.copiedPackages.contains name && isInside resolved (root / trial.packagesDir / name) then
+    if trial.copiedPackages.contains name && isInside resolved (cache / name) then
       throw <| IO.userError s!"Cannot copy {name} into its own source directory at {path}."
-    let inside := if owners.isEmpty then isInside root resolved else
-      owners.any fun owner => isInside (root / trial.packagesDir / owner) resolved
+    let inside ← if owners.isEmpty then pure (isInside root resolved) else
+      owners.anyM fun (owner : String) => do return isInside (← IO.FS.realPath (root / trial.packagesDir / owner)) resolved
     unless inside && (← resolved.isDir) do
       throw <| IO.userError s!"Missing or external local path dependency {name} at {path}."
 

@@ -73,6 +73,9 @@ def render (report : Json) : String := Id.run do
   if let .ok check := report.getObjVal? "verification" then
     let status := string check "status"
     lines := lines.push s!"\nBuild {status}: {string check "message"}"
+    if status != "passed" then
+      let targets := (rows report "build_targets").filterMap (·.getStr?.toOption)
+      unless targets.isEmpty do lines := lines.push ("  Requested targets: " ++ ", ".intercalate targets.toList)
     if let .obj pins := report.getObjValD "trial_revisions" then
       if pins.isEmpty && report.getObjValD "auto_selected" == .bool true then
         lines := lines.push "  No alternate revision was selected. This trial uses the current lock."
