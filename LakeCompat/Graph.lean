@@ -11,7 +11,13 @@ namespace Graph
 
 private abbrev ReadText := FilePath → IO (Option String)
 private abbrev Issue := String × String
-private abbrev Repositories := Std.HashMap FilePath String
+
+private structure Checkout where
+  repo : FilePath
+  revision : String
+  deriving BEq, Hashable, Inhabited
+
+private abbrev Repositories := Std.HashMap FilePath (Except String Checkout)
 
 private def fileText? (file : FilePath) : IO (Option String) := do
   try return some (← IO.FS.readFile file)
@@ -42,12 +48,16 @@ private def appendComponent (p : FilePath) (s : String) : FilePath :=
 
 /-- Resolve the existing prefix as well when a checkout or a path pin has not been materialized. -/
 private partial def resolvePath (p : FilePath) : IO FilePath := do
-  try IO.FS.realPath p
+  try
+    -- Some realpath implementations simplify "file/.." even though it is not traversable.
+    if p.components.contains ".." then discard p.metadata
+    IO.FS.realPath p
   catch
     | .noFileOrDirectory .. =>
       let some parent := p.parent | return p
       let leaf := (p.components.getLast?).getD ""
-      return appendComponent (← resolvePath parent) leaf
+      -- Keep '..' after an unmaterialized component. The OS cannot traverse that prefix.
+      return (← resolvePath parent) / leaf
     | e => throw e
 
 private structure Located where
@@ -106,10 +116,19 @@ private def rootParts (p : FilePath) : FilePath × List String :=
     | [] => (⟨"\\"⟩, [])
   else (⟨"/"⟩, parts.drop 1)
 
+private def enterCheckout (repos : Repositories) (alias : FilePath) (q : DirectoryQuery α) :
+    IO (DirectoryQuery α × Option Checkout) := do
+  let checkout ← IO.ofExcept repos[alias]!
+  let some suffix := GitTree.relativeTo? alias q.path
+    | throw <| IO.userError s!"{q.path} leaves the locked repository {alias}"
+  let path := if suffix.isEmpty then checkout.repo else checkout.repo / suffix
+  return ({q with path}, some checkout)
+
 /-- Resolve workspace prefixes until we reach a locked checkout. Its remaining components,
     including any '..' after a committed symlink, are interpreted by the Git reader. -/
 private def locatePath (repos : Repositories) (cache : PrefixCache) (q : DirectoryQuery α) :
-    IO (DirectoryQuery α × Option FilePath) := do
+    IO (DirectoryQuery α × Option Checkout) := do
+  if let some repo := q.gitRepo then return ← enterCheckout repos repo q
   let p := q.path
   if repos.isEmpty then return ({q with path := ← resolvePath p}, none)
   let (root, parts) := rootParts p
@@ -119,6 +138,8 @@ private def locatePath (repos : Repositories) (cache : PrefixCache) (q : Directo
   while let part :: tail := rest do
     rest := tail
     if part.isEmpty || part == "." then continue
+    if part == ".." then
+      unless ← dir.isDir do throw <| IO.userError s!"Expected a directory before '..' at {dir}"
     let next := appendComponent dir part
     if repos.contains next then dir := next
     else
@@ -138,7 +159,7 @@ private def locatePath (repos : Repositories) (cache : PrefixCache) (q : Directo
     repeat
       if repos.contains ancestor then
         let path := tail.foldl (fun path (part : String) => path / part) dir
-        return ({q with path, workspaceLinks := links}, some ancestor)
+        return ← enterCheckout repos ancestor {q with path, workspaceLinks := links}
       -- Windows realPath can resolve an entire link target inside a repository at once.
       if dir == next then break
       let some parent := ancestor.parent | break
@@ -237,11 +258,9 @@ private def inspectDirectories (repos : Repositories) (env : GitTree.Env)
   let mut pending := queries
   let mut results := #[]
   while !pending.isEmpty do
-    let mut groups : Std.HashMap FilePath (Array (DirectoryQuery α)) := ∅
+    let mut groups : Std.HashMap Checkout (Array (DirectoryQuery α)) := ∅
     for q in pending do
-      let located ← match q.gitRepo with
-        | some repo => pure (.ok (q, some repo))
-        | none => (locatePath repos cache q).toBaseIO
+      let located ← (locatePath repos cache q).toBaseIO
       let (q, repo) ← match located with
         | .ok location => pure location
         | .error e =>
@@ -252,8 +271,8 @@ private def inspectDirectories (repos : Repositories) (env : GitTree.Env)
       else
         results := results.push (← inspect q (.ok { path := q.path }))
     pending := #[]
-    let batches ← mapConcurrent groups.toArray fun (repo, group) =>
-      inspectGit repo repos[repo]! env group inspect
+    let batches ← mapConcurrent groups.toArray fun (checkout, group) =>
+      inspectGit checkout.repo checkout.revision env group inspect
     for batch in batches do
       for result in batch do
         match result with
@@ -263,6 +282,26 @@ private def inspectDirectories (repos : Repositories) (env : GitTree.Env)
 
 private abbrev Observations := Std.TreeMap String Observation
 private abbrev SourcePaths := Std.HashMap FilePath (Except Issue FilePath)
+
+/-- A cache entry may link to a working tree that local path dependencies also name directly.
+    Both spellings must use the locked commit. An explicit cache name disambiguates different
+    revisions of one working tree; a physical path alone cannot. -/
+private def repositories (packagesDir : FilePath) (lock : Lock) : IO Repositories := do
+  let mut physical : Repositories := ∅
+  let mut entries : Repositories := ∅
+  for (name, pkg) in lock.packages do
+    if let .git _ rev .. := pkg.source then
+      let entry := packagesDir / name
+      let repo := (← (IO.FS.realPath entry).toBaseIO).toOption.getD entry
+      let checkout := {repo, revision := rev.toLower : Checkout}
+      entries := entries.insert entry (.ok checkout)
+      if entry != repo then
+        physical := physical.alter repo fun existing => some <| match existing with
+          | none => .ok checkout
+          | some (.ok prior) => if prior == checkout then .ok checkout else
+              .error s!"Multiple revisions are locked for the checkout at {repo}."
+          | some (.error e) => .error e
+  return if physical.isEmpty then entries else physical.insertMany entries
 
 private def observe (project packages : FilePath) (lock : Lock) (repos : Repositories)
     (env : GitTree.Env) : IO (Observations × SourcePaths) := do
@@ -279,8 +318,8 @@ private def observe (project packages : FilePath) (lock : Lock) (repos : Reposit
       | .error (kind, message) => pure (problem ⟨q.key, q.path⟩ kind message)
       | .ok dir => do
         let p := ⟨q.key, dir.path⟩
-        if dir.committed || (← dir.path.isDir) then readPackage p project dir.repo dir.readText dir.issues
-        else pure (missing p)
+        let available ← if dir.committed then pure true else dir.path.isDir
+        if available then readPackage p project dir.repo dir.readText dir.issues else pure (missing p)
     return ({obs with issues := q.issues ++ obs.issues}, result.map (·.path))
   let mut packages := ∅
   let mut sources := ∅
@@ -371,21 +410,20 @@ private def finding (name : String) (path : List String) (issue : Issue) : Json 
 end Graph
 open Graph
 
-/-- Inspect the local dependency graph at the revisions selected by the root lock. -/
-def analyze (project : FilePath) (target : String) : IO Json := do
+/-- Inspect the local dependency graph and return the exact manifest used for the report. -/
+def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Json) := do
   let project ← IO.FS.realPath project
   let target ← IO.ofExcept (normalizeToolchain target)
   let file := project / manifestName
-  let lock ← IO.ofExcept (Lock.parse file (← IO.FS.readFile file))
+  let raw ← IO.ofExcept ((Json.parse (← IO.FS.readFile file)).mapError (s!"{file}: {·}"))
+  let lock ← IO.ofExcept (Lock.ofJson file raw)
   let dirname := project.fileName.getD "[anonymous]"
   let root := lock.name.getD dirname
   let root := if root == "[anonymous]" then dirname else root
   let lakeDir := project / lock.lakeDir
   let packagesDir ← resolvePath (lock.packagesDir.elim (lakeDir / "packages") (project / ·))
   let rootPin ← pin? project fileText?
-  let mut repos : Repositories := ∅
-  for (name, pkg) in lock.packages do
-    if let .git _ rev .. := pkg.source then repos := repos.insert (packagesDir / name) rev
+  let repos ← repositories packagesDir lock
   let env ← if repos.isEmpty then pure #[] else GitTree.environment
   let (observations, known) ← observe project packagesDir lock repos env
   let paths := shortestPaths root observations
@@ -418,7 +456,12 @@ def analyze (project : FilePath) (target : String) : IO Json := do
                                   ("selected_revision", toJson (selected.bind (·.source.revision?)))]
         let chain := if path.isEmpty then [] else path ++ [child]
         findings := findings.push ((finding child chain issue).mergeObj detail)
-  return Json.mkObj [("project", root), ("target", target), ("root_toolchain", toJson rootPin),
-                     ("packages", .arr packages), ("findings", .arr findings)]
+  let report := Json.mkObj [("project", root), ("target", target), ("root_toolchain", toJson rootPin),
+                            ("packages", .arr packages), ("findings", .arr findings)]
+  return (report, raw)
+
+/-- Inspect the local dependency graph at the revisions selected by the root lock. -/
+def analyze (project : FilePath) (target : String) : IO Json := do
+  return (← analyzeWithManifest project target).1
 
 end LakeCompat

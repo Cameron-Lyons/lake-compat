@@ -1,5 +1,6 @@
 import Lean.Data.Json.Parser
 import Lean.Data.Json.Printer
+import Lake.Util.Version
 import Std.Data.TreeMap
 
 namespace LakeCompat
@@ -118,11 +119,9 @@ private def decodePackage (raw : Json) : Except String LockedPackage := do
   return { name, scope, inherited, manifestFile, source }
 
 private def supportedVersion : Json → Bool
-  | .num n => [5, 6, 7].contains n
+  | (n : Nat) => n >= 5
   | .str version =>
-    match (version.takeWhile (· != '-')).copy.splitOn "." with
-    | ["1", minor, patch] => [minor, patch].all fun s => !s.isEmpty && s.all Char.isDigit
-    | _ => false
+    (Lake.StdVer.parse version).toOption.any fun v => v.major == 1 || (v.major == 0 && v.minor >= 5)
   | _ => false
 
 /-- Decode the semantic-versioned lock and the earlier tagged formats used by Lake. -/

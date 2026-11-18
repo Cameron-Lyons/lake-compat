@@ -6,6 +6,10 @@ license = "Apache-2.0"
 defaultTargets = ["lake-compat"]
 testDriver = "«lake-compat-tests»"
 
+[[input_file]]
+name = "releaseLicense"
+path = "LICENSE"
+
 [[input_dir]]
 name = "demoSources"
 path = "examples/upgrade-demo"
@@ -29,7 +33,8 @@ moreLinkArgs = ["-linitialize_minimal"]
 [[lean_exe]]
 name = "lake-compat-tests"
 root = "LeanTests.Main"
+needs = ["lake-compat", "package-release"]
 
 [[lean_exe]]
-name = "verify-test-driver"
-root = "LeanTests.VerifyDriver"
+name = "package-release"
+root = "PackageRelease"

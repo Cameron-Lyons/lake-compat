@@ -1,7 +1,4 @@
 .lake/
-__pycache__/
-*.egg-info/
-/build/
 /dist/
 /examples/realworld/
 /verification.log

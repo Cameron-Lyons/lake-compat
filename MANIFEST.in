@@ -1,7 +1,0 @@
-include requirements-dev.txt tools/build_zipapp.py tools/check_wheel.py
-include LakeCompat.lean LakeCompatMain.lean lakefile.toml lake-manifest.json lean-toolchain
-recursive-include LakeCompat *.lean
-recursive-include LeanTests *.lean
-include examples/upgrade-demo/*.lean examples/upgrade-demo/*.toml examples/upgrade-demo/*.json examples/upgrade-demo/lean-toolchain
-include examples/upgrade-demo/greeting/*.lean examples/upgrade-demo/greeting/*.toml examples/upgrade-demo/greeting/*.json examples/upgrade-demo/greeting/lean-toolchain
-recursive-include tests *.py

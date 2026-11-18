@@ -40,11 +40,11 @@ For example, in the Lean RealWorld application, `realworld -> jose -> json` iden
 | `lake-compat 4.36.0 --try-revision "Cli=$CLI_COMMIT"` | Test a specific full Git SHA. Repeat the option to test several changes together. Explicit choices take precedence over automatic choices. |
 | `lake-compat 4.36.0 --json --strict` | Produce a machine-readable metadata report suitable for CI. |
 
-Suggestions use `curl` to query Reservoir for indexed GitHub repositories. The lookup checks the package's repository, subdirectory, and exact target toolchain. It prefers successful recorded builds and flags any that required a dependency update. It also lists revisions that declare the target when build evidence is unavailable. The report distinguishes an unavailable lookup from a lookup that found no candidates. [Reservoir](https://reservoir.lean-lang.org/)
+Suggestions use `curl` to query Reservoir for indexed GitHub repositories. The lookup checks the package's repository, subdirectory, and exact target toolchain. It prefers successful recorded builds and flags any that required a dependency update. It also lists revisions that declare the target when build evidence is unavailable. If only one history can be retrieved, the report labels each candidate with its available evidence. In JSON, `unavailable_history` identifies the missing `builds` or `versions` history. A lookup with incomplete history and no candidates is reported as unavailable. [Reservoir](https://reservoir.lean-lang.org/)
 
-Build trials require Git, a POSIX host, and the target already installed in elan. For example, `elan toolchain install leanprover/lean4:v4.36.0` makes that toolchain available. A trial copies the working source, including uncommitted project edits, into a temporary directory, sets the target and selected pins there, and runs the default Lake build. Lake can fetch dependencies and execute project and dependency build scripts with your permissions. Git dependencies come from the locked commits. The root snapshot omits `.git` and Lake caches, so a build step that needs the root repository's history can fail in the trial.
+Build trials require Git, a POSIX host, and the target already installed in elan. For example, `elan toolchain install leanprover/lean4:v4.36.0` makes that toolchain available. A trial copies the working source, including uncommitted project edits, into a temporary directory, sets the target and selected pins there, and runs the default Lake build. Lake can fetch dependencies and execute project and dependency build scripts with your permissions. Git dependencies come from the locked commits. A relative Git URL such as `../greeting` is resolved from the original project so the trial can fetch the same local repository. The root snapshot omits `.git` and Lake caches, so a build step that needs the root repository's history can fail in the trial.
 
-A successful trial checks that Lake retained the trial manifest and toolchain and that the resulting Git checkouts match every expected revision. With `--json`, `trial_revisions` lists requested changes and `verification.checked_revisions` records the full set of Git pins in a passing build. To adopt a passing trial, update `lean-toolchain` and the relevant requirements in your project's `lakefile.toml` or `lakefile.lean`, regenerate the manifest with Lake, and verify the resulting lock.
+The trial starts from the lock used for the metadata scan. If that lock changes before the snapshot, verification reports an inconclusive result. A successful trial checks that Lake retained the trial manifest and toolchain and that the resulting Git checkouts match every expected revision. With `--json`, `trial_revisions` lists requested changes and `verification.checked_revisions` records the full set of Git pins in a passing build. To adopt a passing trial, update `lean-toolchain` and the relevant requirements in your project's `lakefile.toml` or `lakefile.lean`, regenerate the manifest with Lake, and verify the resulting lock.
 
 Automatic trials test one combination and hold the dependency graph fixed. If an upgrade adds a dependency, use Lake to resolve that changed graph on an upgrade branch. The verifier supports the standard `.lake` metadata directory, in-tree package directories, in-tree path dependencies, and relative symlinks within the copied source. Lake materializes fresh checkouts in the trial's package directory. If you keep other source files alongside those checkouts in a directory such as `vendor/`, the trial copies them too. External path dependencies, package overrides, and links that cannot be reproduced in the snapshot yield an inconclusive result.
 
@@ -62,42 +62,26 @@ The source snapshot limit is 1 GiB. The `lake build` step has a ten-minute timeo
 
 Package metadata findings always describe the project's original lock. A trial build has its own result. Project-specific tests can be run separately after adopting the pins.
 
-## Python distributions
+## Standalone distribution
 
-The wheel and zipapp bundle the same native executable, so each build targets its host platform. Both launchers support Python 3.9 or later. Installing a prebuilt wheel or running a zipapp requires no Lean installation for metadata scans.
+Build a release archive for the host platform with Lake and `tar`. The command prints the archive path. The archive contains the native executable and its license. On macOS, the build uses `MACOSX_DEPLOYMENT_TARGET` when set and otherwise targets the host's macOS version.
 
 ```sh
-python3 -m pip install .
-lake-compat 4.36.0 --demo
-
-python3 tools/build_zipapp.py
-python3 dist/lake-compat.pyz 4.36.0 --demo
+lake exe package-release dist
 ```
 
-Both build commands require the source checkout or source distribution and its Lean toolchain.
+Extract the archive on a compatible host, then run `./lake-compat 4.36.0 --demo` or place the executable on your path. The executable can scan metadata without a Lean installation. Build verification still uses the selected toolchain through elan.
 
 ## Development checks
 
-CI runs the native and integration tests on Ubuntu with Python 3.9 and macOS with Python 3.15. Run the following commands from the source checkout in a Python virtual environment, with `actionlint` and `shellcheck` installed for workflow linting.
+CI runs the Lean tests on Ubuntu and macOS. The suite exercises the CLI, Git checkouts, isolated builds, and the packaged executable. Run these checks from the source checkout with Git, elan, and the pinned Lean toolchain installed. Workflow linting uses `actionlint` and `shellcheck`.
 
 ```sh
-python -m pip install -r requirements-dev.txt
-ruff check .
-ruff format --check .
 actionlint
-lake --wfail lint --linters=.extra LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main LeanTests.VerifyDriver
-lake --wfail build LakeCompat lake-compat verify-test-driver
+lake --wfail lint --linters=.extra LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main PackageRelease
+lake --wfail build LakeCompat lake-compat package-release
 lake --wfail test
-python -W error -m unittest discover -s tests -t . -v
 lake exe lake-compat "$(cat lean-toolchain)" --demo --verify
-```
-
-To check the distribution, build into an empty directory. The build frontend creates a source distribution, then builds the wheel from its contents. The smoke test installs that wheel in a fresh environment and checks the demo's JSON report with an empty `PATH`.
-
-```sh
-artifacts=$(mktemp -d)
-python -m build --outdir "$artifacts"
-python tools/check_wheel.py "$artifacts"/*.whl
 ```
 
 Lake-compat is distributed under the Apache License, Version 2.0. [License](LICENSE)

@@ -143,11 +143,33 @@ private def testFailures : IO Unit := do
       pure (if req == endpoint then metadata else if req.endsWith "/versions" then dataRows #[] else bad))
     check (status report == "unavailable") "malformed records must not produce no_match"
 
+private def testPartialHistory : IO Unit := do
+  let lookup := fun (versions builds : Except RegistryError Json) =>
+    suggestVersions url target (some "mathlib") (fetch := fun req =>
+      if req == endpoint then pure metadata
+      else if req == endpoint ++ "/versions" then ofExcept versions
+      else if req == endpoint ++ "/builds" then ofExcept builds
+      else throw (.http 418))
+  let versionRows := dataRows #[version (rev 'a') (some "v1")]
+  let buildRows := dataRows #[build (rev 'b') [("requiredUpdate", true)]]
+  let checkPartial := fun report evidence missing => do
+    check (status report == "found" && (rows report).size == 1) report.compress
+    check ((rows report)[0]!.getObjValD "evidence" == evidence) "incorrect partial evidence"
+    check (report.getObjValD "unavailable_history" == missing)
+      "partial results must identify the missing history"
+  checkPartial (← lookup (.error (.http 503)) (.ok buildRows)) "built" "versions"
+  checkPartial (← lookup (.ok versionRows) (.error .transport)) "declared" "builds"
+  let empty ← lookup (.ok (dataRows #[])) (.error .transport)
+  check (status empty == "unavailable") "empty partial data cannot establish no_match"
+  let malformed ← lookup (.ok versionRows) (.ok (dataRows #[build (rev 'a') [] false, Json.null]))
+  check (status malformed == "unavailable") "invalid build data cannot promote a failed revision"
+
 def run : IO Unit := do
   testRanking
   testTruncation
   testTiedEvidence
   testIdentity
   testFailures
+  testPartialHistory
 
 end LeanTests.Releases
