@@ -1,4 +1,6 @@
 import Lean.Data.Json.Basic
+import Std.Data.HashSet
+import LakeCompat.Releases
 
 namespace LakeCompat.Report
 open Lean
@@ -11,6 +13,14 @@ def string (obj : Json) (key : String) (fallback := "") : String :=
 
 def rows (obj : Json) (key : String) : Array Json :=
   (obj.getObjValD key).getArr?.toOption.getD #[]
+
+def flaggedGitPackages (report : Json) : Array Json := Id.run do
+  let mut flagged : Std.HashSet String := {}
+  for finding in rows report "findings" do
+    flagged := flagged.insert (string finding "package")
+    if let some parent := string? finding "parent" then flagged := flagged.insert parent
+  return (rows report "packages").filter fun pkg =>
+    string pkg "type" == "git" && flagged.contains (string pkg "name")
 
 def exitCode (report : Json) (strict : Bool) : UInt32 :=
   match string (report.getObjValD "verification") "status" with
@@ -40,8 +50,10 @@ def render (report : Json) : String := Id.run do
   let mut lines := #[header, s!"{count packages.size "locked package"}, {count findings.size "metadata finding"}"]
   for finding in findings do
     let path := (rows finding "path").filterMap (·.getStr?.toOption)
-    let chain := if path.isEmpty then string finding "package" ++ " (parent unknown)"
-                 else " -> ".intercalate path.toList
+    let chain := if !path.isEmpty then " -> ".intercalate path.toList
+                 else if let some parent := string? finding "parent" then
+                   s!"{parent} -> {string finding "package"} (path to {parent} unknown)"
+                 else string finding "package" ++ " (parent unknown)"
     lines := lines.push s!"  [{(string finding "kind").replace "_" " "}] {chain}"
     lines := lines.push ("    " ++ string finding "message")
   if findings.any (fun f => string f "kind" == "toolchain_mismatch") then
@@ -71,7 +83,9 @@ def render (report : Json) : String := Id.run do
   else
     lines := lines.push "\nBuild not run. Use --verify to test the locked set on this toolchain."
     if !findings.isEmpty && suggestions.isNull then
-      lines := lines.push "Use --suggest to look up alternative dependency revisions."
+      if (flaggedGitPackages report).any fun pkg =>
+          Releases.supportsLookup (string pkg "url") (string? pkg "name") (string? pkg "scope") then
+        lines := lines.push "Use --suggest to look up alternative dependency revisions."
   return "\n".intercalate lines.toList
 
 end LakeCompat.Report

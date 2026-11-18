@@ -40,14 +40,8 @@ private def explicitPins (packages : Array Json) (revisions : Array (String × S
   return pins
 
 private def lookupSuggestions (report : Json) : IO Json := do
-  let mut flagged : Std.HashSet String := {}
-  for finding in Report.rows report "findings" do
-    flagged := flagged.insert (Report.string finding "package")
-    if let some parent := Report.string? finding "parent" then flagged := flagged.insert parent
-  let packages := (Report.rows report "packages").filter fun pkg =>
-    flagged.contains (Report.string pkg "name") && Report.string pkg "type" == "git"
   let target := Report.string report "target"
-  let results ← mapConcurrent packages fun pkg => do
+  let results ← mapConcurrent (Report.flaggedGitPackages report) fun pkg => do
     let name := Report.string pkg "name"
     let result ← Releases.suggestVersions (Report.string pkg "url") target
       (some name) (Report.string? pkg "scope") (Report.string? pkg "sub_dir")
@@ -84,7 +78,8 @@ private def scan (opts : Options) (project : FilePath) : IO Json := do
       pins := selectedPins packages suggestions pins
       report := report.setObjVal! "auto_selected" true
   if opts.verify || opts.trySuggested || !pins.isEmpty then
-    let result ← verifyBuild project (Report.string report "target") pins.toArray
+    let timeout := opts.buildTimeoutSeconds.getD defaultBuildTimeoutSeconds
+    let result ← verifyBuild project (Report.string report "target") pins.toArray (timeout * 1000)
     report := (report.setObjVal! "verification" result).setObjVal! "trial_revisions"
       (Json.mkObj (pins.toList.map fun (k, v) => (k, .str v)))
   return if opts.demo then displayDemo project report else report
@@ -95,12 +90,13 @@ private def reportError (json : Bool) (message : String) : IO UInt32 := do
   return 2
 
 def run (args : List String) : IO UInt32 := do
-  if (args.takeWhile (· != "--")).any (fun arg => arg == "--help" || arg == "-h") then
+  let flags := args.takeWhile (· != "--")
+  if flags.any (fun arg => arg == "--help" || arg == "-h") then
     IO.println usage
     return 0
   let opts ← match parseOptions args with
     | .ok opts => pure opts
-    | .error message => return ← reportError (args.contains "--json") message
+    | .error message => return ← reportError (flags.contains "--json") message
   try
     let report ← if opts.demo then withDemo (scan opts) else scan opts (opts.project.getD ".")
     IO.println (if opts.json then report.compress else Report.render report)

@@ -1,6 +1,7 @@
 """Package the host's native Lean executable in a standalone Python zipapp."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,24 +14,6 @@ def build_native(root):
     return root / ".lake" / "build" / "bin" / name
 
 
-LAUNCHER = b"""\
-from pathlib import Path
-import os
-import shutil
-import subprocess
-import sys
-from tempfile import TemporaryDirectory
-from zipfile import ZipFile
-
-with TemporaryDirectory(prefix="lake-compat-") as temp:
-    binary = Path(temp) / ("lake-compat.exe" if os.name == "nt" else "lake-compat")
-    with ZipFile(sys.argv[0]) as archive, archive.open("native") as src, binary.open("wb") as dst:
-        shutil.copyfileobj(src, dst)
-    binary.chmod(0o700)
-    raise SystemExit(subprocess.call([binary, *sys.argv[1:]]))
-"""
-
-
 def build_zipapp(root, output):
     binary = build_native(root)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -38,15 +21,18 @@ def build_zipapp(root, output):
         staged = Path(staging) / output.name
         staged.write_bytes(b"#!/usr/bin/env python3\n")
         with ZipFile(staged, "a") as archive:
-            for name, data in [
-                ("__main__.py", LAUNCHER),
-                ("LICENSE", (root / "LICENSE").read_bytes()),
-                ("native", binary.read_bytes()),
+            for name, path in [
+                ("__main__.py", root / "lake_compat" / "cli.py"),
+                ("LICENSE", root / "LICENSE"),
+                ("native", binary),
             ]:
                 entry = ZipInfo(name)
                 entry.create_system = 3
                 entry.external_attr = 0o100644 << 16
-                archive.writestr(entry, data, compress_type=ZIP_DEFLATED)
+                entry.compress_type = ZIP_DEFLATED
+                entry.file_size = path.stat().st_size
+                with path.open("rb") as src, archive.open(entry, "w") as dst:
+                    shutil.copyfileobj(src, dst)
         staged.chmod(0o755)
         staged.replace(output)
 

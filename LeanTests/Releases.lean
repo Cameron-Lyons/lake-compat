@@ -78,13 +78,30 @@ private def testTruncation : IO Unit := do
     "limit five by update requirement and deterministic full-SHA tie breaker"
   check (report.getObjValD "message" == "Showing 5 of 7 candidate revisions.") "count every eligible commit"
 
+private def testTiedEvidence : IO Unit := do
+  let versions := #[version (rev 'a') (some "alpha"), version (rev 'a') (some "beta"),
+                    version (rev 'b') none]
+  let builds := #[build (rev 'a'), build (rev 'a') [("tested", true)],
+                  build (rev 'b'), build (rev 'b') [] false].map
+    (·.setObjVal! "runAt" "2026-11-01T12:00:00Z")
+  let lookup := fun vs bs => suggestVersions url target (some "mathlib")
+    (fetch := fixture endpoint (metadata) vs bs)
+  let report ← lookup versions builds
+  check (report == (← lookup versions.reverse builds.reverse))
+    "equally recent evidence must rank independently of registry response order"
+  let candidates := rows report
+  check (candidates.size == 1 && candidates[0]!.getObjValD "revision" == rev 'a' &&
+    candidates[0]!.getObjValD "tested" == .bool true && candidates[0]!.getObjValD "tag" == "beta")
+    "a simultaneous failure disqualifies its revision, and a confirmed test is preferred"
+
 private def testIdentity : IO Unit := do
   let calls ← IO.mkRef #[]
   let metaOnly (m : Json) : Fetch := fun req => do
     calls.modify (·.push req)
     return m
   for repoUrl in ["https://github.com.evil.test/name/repo", "file:///tmp/repo",
-      "https://token@github.com/name/repo", "https://github.com/name/.."] do
+      "https://token@github.com/name/repo", "https://github.com/name/..",
+      "https://github.com:444/name/repo"] do
     let report ← suggestVersions repoUrl target (fetch := metaOnly (metadata))
     check (status report == "unsupported") repoUrl
   for invalid in ["..", "a/b", "\nname"] do
@@ -101,9 +118,10 @@ private def testIdentity : IO Unit := do
 
   let base := "https://reservoir.lean-lang.org/api/v1/packages/my%20scope/my%2Bpkg"
   let fetch := fixture base (metadata "my+pkg" repo.toUpper (some "src/library")) #[] #[]
-  let report ← suggestVersions ("ssh://git@github.com/" ++ repo ++ "/") target
-    (some "my+pkg") (some "my scope") (some "./src//library/") fetch
-  check (status report == "no_match") "encoded package path, case-insensitive source and normalized subdirectory"
+  for baseUrl in ["ssh://git@github.com/", "ssh://git@github.com:22/", "https://github.com:443/"] do
+    let report ← suggestVersions (baseUrl ++ repo ++ "/") target
+      (some "my+pkg") (some "my scope") (some "./src//library/") fetch
+    check (status report == "no_match") "encoded package path, default port and normalized subdirectory"
 
 private def testFailures : IO Unit := do
   for (err, detail) in [(RegistryError.http 404, "absent"), (.http 503, "503"),
@@ -115,7 +133,12 @@ private def testFailures : IO Unit := do
   for bad in [Json.null, Json.mkObj [("sources", "oops")]] do
     let report ← suggestVersions url target (fetch := fun _ => pure bad)
     check (status report == "unavailable") "malformed metadata must not look like an empty index"
-  for bad in [Json.mkObj [], dataRows #[.null], dataRows #[((build (rev 'c')).setObjVal! "runAt" 7)]] do
+  let badName ← suggestVersions url target (some "mathlib")
+    (fetch := fun _ => pure ((metadata).setObjVal! "name" .null))
+  check (status badName == "unavailable") "invalid package metadata must not look like a different package"
+  for bad in [Json.mkObj [], dataRows #[.null], dataRows #[((build (rev 'c')).setObjVal! "runAt" 7)],
+      dataRows #[((build (rev 'c')).setObjVal! "built" .null)],
+      dataRows #[((build (rev 'c')).setObjVal! "built" "false")]] do
     let report ← suggestVersions url target (some "mathlib") (fetch := fun req =>
       pure (if req == endpoint then metadata else if req.endsWith "/versions" then dataRows #[] else bad))
     check (status report == "unavailable") "malformed records must not produce no_match"
@@ -123,6 +146,7 @@ private def testFailures : IO Unit := do
 def run : IO Unit := do
   testRanking
   testTruncation
+  testTiedEvidence
   testIdentity
   testFailures
 

@@ -13,6 +13,7 @@ Explain which locked dependencies need attention for a Lean upgrade.
   --verify                 Build the locked project with the installed target
   --try-suggested          Build a trial with each package's top candidate
   --try-revision NAME=SHA  Try a full Git commit; repeat to combine changes
+  --build-timeout SECONDS  Time allowed for lake build (default: 600 seconds)
   --json                   Emit a machine-readable report
   --strict                 Exit 1 if the original lock has metadata findings
   -h, --help               Show this help"
@@ -25,6 +26,7 @@ structure Options where
   verify : Bool := false
   trySuggested : Bool := false
   revisions : Array (String × String) := #[]
+  buildTimeoutSeconds : Option Nat := none
   json : Bool := false
   strict : Bool := false
   deriving Inhabited
@@ -42,6 +44,18 @@ private def positional (opts : Options) (value : String) : Except String Options
   unless !value.isEmpty do throw "expected a non-empty target Lean toolchain"
   return {opts with target := value}
 
+private def optionValue (opts : Options) (flag value : String) : Except String Options := do
+  match flag with
+  | "--project" =>
+    if value.isEmpty then throw "--project requires a directory"
+    return {opts with project := some value}
+  | "--try-revision" => return {opts with revisions := opts.revisions.push (← parsePin value)}
+  | "--build-timeout" =>
+    let some seconds := value.toNat?.filter (· > 0)
+      | throw "--build-timeout expects a positive integer in seconds"
+    return {opts with buildTimeoutSeconds := some seconds}
+  | _ => throw s!"unknown option '{flag}'"
+
 def parseOptions (args : List String) : Except String Options := do
   let mut opts : Options := {}
   let mut positionalOnly := false
@@ -51,13 +65,12 @@ def parseOptions (args : List String) : Except String Options := do
       opts ← positional opts arg
     else if let some flag := pending then
       if arg.startsWith "-" then throw s!"{flag} requires a value"
-      if flag == "--project" then opts := {opts with project := some arg}
-      else opts := {opts with revisions := opts.revisions.push (← parsePin arg)}
+      opts ← optionValue opts flag arg
       pending := none
     else
       match arg with
       | "--" => positionalOnly := true
-      | "--project" | "--try-revision" => pending := some arg
+      | "--project" | "--try-revision" | "--build-timeout" => pending := some arg
       | "--demo" => opts := {opts with demo := true}
       | "--suggest" => opts := {opts with suggest := true}
       | "--verify" => opts := {opts with verify := true}
@@ -65,11 +78,9 @@ def parseOptions (args : List String) : Except String Options := do
       | "--json" => opts := {opts with json := true}
       | "--strict" => opts := {opts with strict := true}
       | _ =>
-        if let some value := arg.dropPrefix? "--project=" then
-          opts := {opts with project := some value.toString}
-        else if let some value := arg.dropPrefix? "--try-revision=" then
-          opts := {opts with revisions := opts.revisions.push (← parsePin value.toString)}
-        else if arg.startsWith "-" then throw s!"unknown option '{arg}'"
+        if arg.startsWith "-" then
+          let some sep := arg.find? '=' | throw s!"unknown option '{arg}'"
+          opts ← optionValue opts (arg.sliceTo sep).copy (arg.sliceFrom sep.next!).copy
         else opts ← positional opts arg
   if let some flag := pending then throw s!"{flag} requires a value"
   if opts.target.isEmpty then throw "expected a target Lean toolchain, for example 4.36.0"

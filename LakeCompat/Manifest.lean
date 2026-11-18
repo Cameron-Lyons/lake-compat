@@ -37,10 +37,15 @@ def normalizeToolchain (value : String) : Except String String := do
 
 /-- Directory spelling of a package name as serialized by Lake. -/
 def packageName (value : String) : Except String String := do
-  let name := (value.replace "«" "").replace "»" ""
+  let invalid := s!"invalid package name {repr value}"
+  let name ← if value.contains '«' || value.contains '»' then do
+    let parsed := value.toName
+    if parsed.isAnonymous then throw invalid
+    pure (parsed.toString (escape := false))
+  else pure value
   if name.isEmpty || name == "." || name == ".." ||
       name.any (fun c => c == '/' || c == '\\' || c == Char.ofNat 0) then
-    throw s!"invalid package name {repr value}"
+    throw invalid
   return name
 
 inductive LockedSource where
@@ -88,10 +93,11 @@ private def boolField (obj : Json) (key : String) (fallback : Option Bool := non
 /-- Unwrap a package without discarding fields needed to write an updated trial lock. -/
 def unpackEntry (raw : Json) : Except String (String × Json × Bool) := do
   let obj ← raw.getObj?.mapError fun _ => "expected a package object"
-  match obj.toList with
-    | [(k, v)] => if k == "path" || k == "git" then pure (k, v, true)
-                   else throw "expected a package with a source type"
-    | _ => pure (← stringField raw "type", raw, false)
+  if obj.size == 1 then
+    let (k, v) := obj.minEntry!
+    if k == "path" || k == "git" then return (k, v, true)
+    throw "expected a package with a source type"
+  return (← stringField raw "type", raw, false)
 
 private def decodePackage (raw : Json) : Except String LockedPackage := do
   let (kind, fields, legacy) ← unpackEntry raw
@@ -124,7 +130,7 @@ def Lock.ofJson (file : FilePath) (raw : Json) : Except String Lock := Except.ma
   unless raw.getObj?.isOk do throw "expected a Lake manifest object"
   let version := (raw.getObjVal? "version").toOption.getD (raw.getObjValD "schemaVersion")
   unless supportedVersion version do throw s!"unsupported Lake manifest version {version.compress}"
-  let name ← optionalString raw "name"
+  let name ← (← optionalString raw "name").mapM packageName
   let lakeDir := (← optionalString raw "lakeDir").getD ".lake"
   let packagesDir ← optionalString raw "packagesDir"
   let fixedToolchain ← boolField raw "fixedToolchain" (some false)

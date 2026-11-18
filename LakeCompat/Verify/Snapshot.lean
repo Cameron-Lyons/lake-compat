@@ -1,4 +1,6 @@
 import Std.Data.HashMap
+import Std.Data.HashSet
+import LakeCompat.Concurrent
 
 open System
 namespace LakeCompat.Verify
@@ -74,22 +76,30 @@ private def validateSnapshot (root : FilePath) : IO Unit := do
     edges := edges.insert dir children
   if directoryLinks then checkDirectoryCycles edges
 
-private def copyBatch (files : Array String) (toDir : FilePath) : IO Unit := do
-  unless files.isEmpty do
-    -- cp preserves executable bits and copies the link itself, including dangling symlinks.
+private def copyBatches (batches : Array (Array String × FilePath)) : IO Unit := do
+  -- Each batch has distinct destination files. cp preserves modes and copies links verbatim.
+  discard <| mapConcurrent batches fun (files, toDir) => do
     discard <| IO.Process.run {cmd := "cp", args := (#["-Pp"] ++ files).push toDir.toString}
 
-def copySources (source destination : FilePath) : IO Unit := do
+def sourceByteLimit := 1024 ^ 3
+
+def copySources (source destination : FilePath) (packagesDir : FilePath := ".lake/packages")
+    (managedPackages : Std.HashSet String := ∅) : IO Unit := do
   if isInside source destination then throw <| IO.userError "The temporary directory must be outside the project."
+  let packageCache := source / packagesDir
   IO.FS.createDir destination
   let mut stack := #[(source, destination)]
   let mut totalBytes := 0
+  let mut batches := #[]
   while let some (dir, toDir) := stack.back? do
     stack := stack.pop
     let mut files := #[]
     let mut argBytes := 0
     for entry in ← dir.readDir do
-      if excluded entry.fileName then continue
+      if excluded entry.fileName || (dir == packageCache && managedPackages.contains entry.fileName) then continue
+      if batches.size >= 16 then
+        copyBatches batches
+        batches := #[]
       let info ← entry.path.symlinkMetadata
       match info.type with
       | .dir =>
@@ -100,14 +110,15 @@ def copySources (source destination : FilePath) : IO Unit := do
       | .file | .symlink =>
         if info.type == .file then
           totalBytes := totalBytes + info.byteSize.toNat
-          if totalBytes > 1024 ^ 3 then throw <| IO.userError "Project sources exceed the 1 GiB temporary-copy limit."
+          if totalBytes > sourceByteLimit then throw <| IO.userError "Project sources exceed the 1 GiB temporary-copy limit."
         files := files.push entry.path.toString
         argBytes := argBytes + entry.path.toString.utf8ByteSize + 1
         if argBytes >= 32768 then
-          copyBatch files toDir
+          batches := batches.push (files, toDir)
           files := #[]
           argBytes := 0
-    copyBatch files toDir
+    unless files.isEmpty do batches := batches.push (files, toDir)
+  copyBatches batches
   validateSnapshot destination
 
 end LakeCompat.Verify
