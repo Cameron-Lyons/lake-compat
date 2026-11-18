@@ -141,3 +141,9 @@ class CliTests(unittest.TestCase):
             code, output = self.call("--json", *args)
             self.assertEqual(code, 2)
             self.assertTrue(json.loads(output)["error"])
+
+    def test_json_after_end_of_options_is_positional(self):
+        result = cli("4.36.0", "--", "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("unexpected positional argument '--json'", result.stderr)

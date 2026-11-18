@@ -4,10 +4,15 @@ namespace LakeCompat.Source
 def isFullRevision (s : String) : Bool :=
   (s.utf8ByteSize == 40 || s.utf8ByteSize == 64) && s.all Char.isHexDigit
 
+/-- Compare Git package subdirectories as POSIX paths, preserving symlink-sensitive `..`. -/
+def directoryKey (value : String) : Bool × List String :=
+  (value.startsWith "/", (value.splitOn "/").filter (fun p => !p.isEmpty && p != "."))
+
 /-- Repository identity for the standard GitHub HTTPS, SSH, and SCP-style remotes. -/
 def githubRepo? (url : String) : Option (String × String) := do
-  let start ← ["https://github.com/", "ssh://git@github.com/", "git@github.com:"].find?
-    (fun p => url.toLower.startsWith p)
+  let lower := url.toLower
+  let start ← ["https://github.com/", "https://github.com:443/", "ssh://git@github.com/",
+    "ssh://git@github.com:22/", "git@github.com:"].find? (fun p => lower.startsWith p)
   let path := ((url.drop start.length).dropSuffix "/").copy
   let [owner, name] := path.splitOn "/" | none
   guard (!owner.isEmpty && owner.all (fun c => c.isAlphanum || c == '-'))

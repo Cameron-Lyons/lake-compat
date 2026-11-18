@@ -1,4 +1,5 @@
 import Std.Data.HashMap
+import LakeCompat.Concurrent
 
 open System
 namespace LakeCompat.Verify
@@ -74,9 +75,9 @@ private def validateSnapshot (root : FilePath) : IO Unit := do
     edges := edges.insert dir children
   if directoryLinks then checkDirectoryCycles edges
 
-private def copyBatch (files : Array String) (toDir : FilePath) : IO Unit := do
-  unless files.isEmpty do
-    -- cp preserves executable bits and copies the link itself, including dangling symlinks.
+private def copyBatches (batches : Array (Array String × FilePath)) : IO Unit := do
+  -- Each batch has distinct destination files. cp preserves modes and copies links verbatim.
+  discard <| mapConcurrent batches fun (files, toDir) => do
     discard <| IO.Process.run {cmd := "cp", args := (#["-Pp"] ++ files).push toDir.toString}
 
 def copySources (source destination : FilePath) : IO Unit := do
@@ -84,12 +85,16 @@ def copySources (source destination : FilePath) : IO Unit := do
   IO.FS.createDir destination
   let mut stack := #[(source, destination)]
   let mut totalBytes := 0
+  let mut batches := #[]
   while let some (dir, toDir) := stack.back? do
     stack := stack.pop
     let mut files := #[]
     let mut argBytes := 0
     for entry in ← dir.readDir do
       if excluded entry.fileName then continue
+      if batches.size >= 16 then
+        copyBatches batches
+        batches := #[]
       let info ← entry.path.symlinkMetadata
       match info.type with
       | .dir =>
@@ -104,10 +109,11 @@ def copySources (source destination : FilePath) : IO Unit := do
         files := files.push entry.path.toString
         argBytes := argBytes + entry.path.toString.utf8ByteSize + 1
         if argBytes >= 32768 then
-          copyBatch files toDir
+          batches := batches.push (files, toDir)
           files := #[]
           argBytes := 0
-    copyBatch files toDir
+    unless files.isEmpty do batches := batches.push (files, toDir)
+  copyBatches batches
   validateSnapshot destination
 
 end LakeCompat.Verify
