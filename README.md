@@ -125,6 +125,8 @@ lake --wfail test
 lake exe lake-compat "$(cat lean-toolchain)" --demo --verify
 ```
 
+After `lake test`, run `python3 scripts/check-report-schema.py` to validate CLI output against the published JSON Schema. The check uses the built executables and needs Python with `jsonschema` installed. Linux CI runs it with `jsonschema==4.25.1`.
+
 ## Release process
 
 Set the same version in `VERSION` and `lakefile.toml`, then run the **Native release** workflow manually to test packaging without publishing. It builds both archives, runs them on separate runners without a Lean installation step, and uses the Linux archive to check a pinned RealWorld conflict, a live Reservoir lookup, a Git-backed upgrade trial, and downstream installation from Git.

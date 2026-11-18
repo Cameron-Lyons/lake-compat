@@ -56,6 +56,12 @@ jobs:
         run: lake --wfail build LakeCompat lake-compat package-release
       - name: Run unit, integration, and distribution tests
         run: lake --wfail test
+      - name: Validate CLI reports against the published JSON Schema
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/schema-venv"
+          "$RUNNER_TEMP/schema-venv/bin/python" -m pip install 'jsonschema==4.25.1'
+          "$RUNNER_TEMP/schema-venv/bin/python" scripts/check-report-schema.py
       - name: Check the CLI and Lake package versions
         run: |
           test "$(lake exe lake-compat --version)" = "lake-compat $(cat VERSION)"
