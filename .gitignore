@@ -5,3 +5,4 @@ __pycache__/
 /dist/
 /examples/realworld/
 /verification.log
+.DS_Store

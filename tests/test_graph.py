@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lake_compat.graph import analyze, normalize_toolchain
+from tests.native import build_cli, cli
+
+setUpModule = build_cli
 
 
 TARGET = "leanprover/lean4:v4.25.0"
@@ -54,18 +56,9 @@ class GraphTest(unittest.TestCase):
         pin(self.project, "4.24.0")
 
     def report(self):
-        return analyze(self.project, TARGET)
-
-    def test_normalize_builtin_and_preserve_custom(self):
-        for value in ("4.25.0", "v4.25.0", "leanprover/lean4:4.25.0", TARGET):
-            self.assertEqual(normalize_toolchain(value), TARGET)
-        self.assertEqual(normalize_toolchain("nightly-2026-10-11"), "leanprover/lean4:nightly-2026-10-11")
-        self.assertEqual(normalize_toolchain("v4.22.0-rc3"), "leanprover/lean4:v4.22.0-rc3")
-        self.assertEqual(normalize_toolchain("fork/lean4:4.23.0"), "fork/lean4:4.23.0")
-        self.assertEqual(normalize_toolchain("local-dev"), "local-dev")
-        for bad in ("", "  \n", "a b", "owner/repo:"):
-            with self.assertRaises(ValueError):
-                normalize_toolchain(bad)
+        result = cli(TARGET, "--project", self.project, "--json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
 
     def test_transitive_revision_conflicts_and_shortest_chains(self):
         for name in ("a", "b", "shared", "leaf"):
@@ -90,6 +83,32 @@ class GraphTest(unittest.TestCase):
         self.assertEqual((conflict["requested_revision"], conflict["selected_revision"]), ("cccc", shared))
         self.assertEqual({p["name"]: p["path"] for p in result["packages"]}["leaf"],
                          ["demo", "a", "shared", "leaf"])
+
+    def test_git_source_conflict_at_same_commit_and_equivalent_remote_spellings(self):
+        parent = self.project / "parent"
+        dependency = self.packages / "leaf"
+        manifest(dependency)
+        pin(dependency)
+        revision = commit_metadata(dependency)
+        root_lock = git_dep("leaf", revision, inherited=True)
+        manifest(self.project, local_dep("parent", "parent"), root_lock)
+        pin(parent)
+        for url in ("https://github.com/Example/Leaf/", "ssh://git@github.com/example/leaf.git",
+                    "git@github.com:example/leaf.git", "https://github.com/another/leaf.git"):
+            with self.subTest(url=url):
+                requested = dict(git_dep("leaf", revision), url=url)
+                manifest(parent, requested)
+                findings = self.report()["findings"]
+                if "another" in url:
+                    self.assertEqual(len(findings), 1)
+                    finding = findings[0]
+                    self.assertEqual((finding["kind"], finding["path"]),
+                                     ("source_conflict", ["demo", "parent", "leaf"]))
+                    self.assertEqual(finding["requested_revision"], finding["selected_revision"])
+                    self.assertIn(url, finding["message"])
+                    self.assertIn(root_lock["url"], finding["message"])
+                else:
+                    self.assertEqual(findings, [])
 
     def test_local_paths_git_subdir_and_custom_manifest(self):
         vendor = self.project / "vendor" / "mono"
@@ -197,6 +216,18 @@ class GraphTest(unittest.TestCase):
         self.assertEqual([f["kind"] for f in report["findings"]], ["unknown_checkout_revision"])
         self.assertEqual(report["packages"][0]["toolchain"], TARGET)
 
+    def test_incomplete_checkout_cannot_borrow_workspace_git_objects(self):
+        manifest(self.project)
+        workspace_rev = commit_metadata(self.project)
+        repo = self.packages / "dependency"
+        manifest(repo)
+        pin(repo)
+        (repo / ".git").mkdir()
+        manifest(self.project, git_dep("dependency", workspace_rev))
+        report = self.report()
+        self.assertEqual([f["kind"] for f in report["findings"]], ["unknown_checkout_revision"])
+        self.assertEqual(report["packages"][0]["toolchain"], TARGET)
+
     def test_local_path_dependency_uses_uncommitted_metadata(self):
         local = self.project / "local"
         manifest(local)
@@ -269,10 +300,12 @@ class GraphTest(unittest.TestCase):
         self.assertIsNone(result["packages"][0]["toolchain"])
 
     def test_invalid_root_input_has_actionable_file_context(self):
-        with self.assertRaises(FileNotFoundError):
-            self.report()
+        result = cli(TARGET, "--project", self.project, "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("lake-manifest.json", json.loads(result.stdout)["error"])
         for package in ({"type": "path", "dir": "x"}, git_dep("a", "aa", scope=[]),
                         git_dep("../a", "aa"), dict(name="a", type="git", inherited="false")):
             manifest(self.project, package)
-            with self.assertRaisesRegex(ValueError, "lake-manifest.json"):
-                self.report()
+            result = cli(TARGET, "--project", self.project, "--json")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("lake-manifest.json", json.loads(result.stdout)["error"])

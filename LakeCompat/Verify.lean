@@ -1,0 +1,100 @@
+import LakeCompat.Verify.Process
+import LakeCompat.Verify.Trial
+
+open Lean System
+
+namespace LakeCompat.Verify
+
+private def report (status message : String) (detail : Json := Json.mkObj []) : Json :=
+  detail.mergeObj <| Json.mkObj [("status", .str status), ("message", .str message)]
+
+private def run (args : Array String) (cwd : FilePath) (env : Environment) (ms : Nat)
+    (detail : IO.Ref Json) : IO CommandResult := do
+  let result ← runCommand args cwd env ms
+  if result.timedOut then
+    unless result.output.isEmpty do detail.modify (·.setObjVal! "output" (.str result.output))
+    let limit := if ms % 1000 == 0 then s!"{ms / 1000}-second" else s!"{ms}-millisecond"
+    throw <| IO.userError s!"Verification exceeded its {limit} command timeout."
+  return result
+
+private def confirmGit (root : FilePath) (pins : Pins) (env : Environment) (detail : IO.Ref Json) : IO Unit := do
+  for (name, expected) in pins do
+    let repo := root / ".lake" / "packages" / name
+    unless (← (repo / ".git").symlinkMetadata.toBaseIO).toOption.any (·.type == .dir) &&
+        (← IO.FS.realPath repo) == repo do
+      throw <| IO.userError s!"Lake did not materialize an isolated checkout of {name}."
+    let head ← run #["git", "rev-parse", "--verify", "HEAD"] repo env 10000 detail
+    if head.exitCode != 0 || head.output != expected then
+      throw <| IO.userError s!"The checkout for {name} does not match its locked revision {expected}."
+    let diff ← run #["git", "diff", "--quiet", "--no-ext-diff", "HEAD", "--"] repo env 30000 detail
+    if diff.exitCode != 0 then
+      throw <| IO.userError s!"Could not confirm that the tracked files in {name} match its locked revision."
+
+private def writeInput (dst : FilePath) (value : String) : IO Unit := do
+  -- Replace links and read-only inputs in the copy without changing their targets.
+  if (← metadata? dst).isSome then IO.FS.removeFile dst
+  IO.FS.writeFile dst value
+
+private def verifyTrial (parent project : FilePath) (target : String) (revisions : Pins)
+    (buildTimeoutMs : Nat) (detail : IO.Ref Json) : IO Json := do
+  let env ← trialEnvironment target parent
+  let lake := #["elan", "run", target, "lake"]
+  let version ← run (lake.push "--version") parent env 20000 detail
+  if version.exitCode != 0 then
+    return report "unavailable" s!"Cannot run Lake with installed toolchain {target}."
+      (Json.mkObj [("output", .str version.output)])
+  let workspace := parent / "project"
+  copySources project workspace
+  let trial ← loadTrial workspace revisions
+  trial.checkLocalPaths workspace false
+  let pinFile := workspace / "lean-toolchain"
+  let lockFile := workspace / manifestName
+  writeInput pinFile (target ++ "\n")
+  writeInput lockFile (trial.manifest.pretty ++ "\n")
+  let build ← run (lake.push "build") workspace env buildTimeoutMs detail
+  detail.set <| Json.mkObj [("output", .str build.output), ("lake_version", .str version.output)]
+  let check ← if build.exitCode == 0 then some <$> run (lake.push "check-build") workspace env 30000 detail else pure none
+  if (← IO.ofExcept <| Json.parse (← IO.FS.readFile lockFile)) != trial.manifest ||
+      (← IO.FS.readFile pinFile).trimAscii != target.toSlice then
+    return report "inconclusive" "The build changed its trial manifest or toolchain." (← detail.get)
+  if build.exitCode != 0 then
+    let hint := if revisions.isEmpty then "" else
+      " If the candidate needs different dependencies, resolve them with lake update on your upgrade branch and rerun the check."
+    return report "failed" s!"lake build exited with code {build.exitCode}.{hint}" (← detail.get)
+  if let some result := check then
+    if result.exitCode != 0 then
+      let output := (build.output ++ "\n" ++ result.output).toUTF8
+      let tail := String.fromUTF8Lossy (output.extract (output.size - logLimit) output.size)
+      detail.modify (·.setObjVal! "output" (.str tail.trimAscii.copy))
+      return report "inconclusive" "Lake could not confirm the project has default build targets." (← detail.get)
+  if (← metadata? (workspace / ".lake" / "package-overrides.json")).isSome then
+    throw <| IO.userError "The build created package overrides; the trial manifest cannot confirm effective pins."
+  confirmGit workspace trial.pins env detail
+  trial.checkLocalPaths workspace true
+  let checked := Json.mkObj (trial.pins.toList.map fun (name, rev) => (name, .str rev))
+  return report "passed" s!"Default targets built on {target} with the trial pins."
+    ((← detail.get).setObjVal! "checked_revisions" checked)
+
+end Verify
+
+/-- Verify the default build on an installed Elan toolchain using an isolated working-source copy. -/
+def verifyBuild (project : FilePath) (target : String) (revisions : Array (String × String) := #[])
+    (buildTimeoutMs : Nat := 600000) : IO Json := do
+  if Platform.isWindows then return Verify.report "unavailable" "Build verification requires a POSIX host."
+  if target.isEmpty || target.startsWith "-" || target.any Char.isWhitespace || target.contains (Char.ofNat 0) then
+    return Verify.report "inconclusive" "Invalid elan toolchain name."
+  let detail ← IO.mkRef (Json.mkObj [])
+  try
+    let source ← IO.FS.realPath project
+    if (← Verify.metadata? (source / ".lake" / "package-overrides.json")).isSome then
+      throw <| IO.userError "This workspace has package overrides; its root manifest alone cannot reproduce them."
+    let mut pins : Verify.Pins := ∅
+    for (name, revision) in revisions do
+      if let some old := pins[name]? then
+        unless old == revision.toLower do throw <| IO.userError s!"Two different trial revisions for {name}."
+      pins := pins.insert name revision.toLower
+    IO.FS.withTempDir fun temp => do
+      Verify.verifyTrial (← IO.FS.realPath temp) source target pins buildTimeoutMs detail
+  catch e => return Verify.report "inconclusive" (toString e) (← detail.get)
+
+end LakeCompat

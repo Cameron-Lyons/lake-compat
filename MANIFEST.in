@@ -1,3 +1,7 @@
 include tools/build_zipapp.py
-include LakeCompatMain.lean lakefile.toml lake-manifest.json lean-toolchain
+include LakeCompat.lean LakeCompatMain.lean lakefile.toml lake-manifest.json lean-toolchain
+recursive-include LakeCompat *.lean
+recursive-include LeanTests *.lean
+include examples/upgrade-demo/*.lean examples/upgrade-demo/*.toml examples/upgrade-demo/*.json examples/upgrade-demo/lean-toolchain
+include examples/upgrade-demo/greeting/*.lean examples/upgrade-demo/greeting/*.toml examples/upgrade-demo/greeting/*.json examples/upgrade-demo/greeting/lean-toolchain
 recursive-include tests *.py

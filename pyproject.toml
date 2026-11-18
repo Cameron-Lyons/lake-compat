@@ -20,6 +20,3 @@ lake-compat = "lake_compat.cli:main"
 
 [tool.setuptools]
 packages = ["lake_compat"]
-
-[tool.setuptools.package-data]
-lake_compat = ["upgrade-demo/*", "upgrade-demo/greeting/*"]

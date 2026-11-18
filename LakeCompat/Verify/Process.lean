@@ -1,0 +1,108 @@
+import Init.Data.String.Lossy
+import Std.Internal.UV.System
+import Std.Sync.Mutex
+
+open System
+
+namespace LakeCompat.Verify
+
+def logLimit := 16 * 1024
+
+structure CommandResult where
+  exitCode : UInt32
+  output : String
+  timedOut : Bool
+
+private structure Excerpt where
+  tail : ByteArray := .empty
+  diagnostic : ByteArray := .empty
+
+/-- Find the first compiler diagnostic about to scroll out of the tail. -/
+private def scrollingDiagnostic (bytes : ByteArray) (overflow : Nat) : ByteArray := Id.run do
+  let mut start := 0
+  let mut afterColon := false
+  for i in [:min bytes.size (overflow + 512)] do
+    let c := Char.ofUInt8 bytes[i]!
+    if i == start || (afterColon && i > 0 && Char.ofUInt8 bytes[i - 1]! != ':') then
+      if c.toLower == 'e' || c.toLower == 'f' then
+        let word := (String.fromUTF8Lossy (bytes.extract i (i + 12))).toLower
+        if word.startsWith "error:" || word.startsWith "fatal:" || word.startsWith "fatal error:" then
+          let offset := max start (i - 512)
+          if offset < overflow then return bytes.extract offset (offset + logLimit / 4)
+    afterColon := c == ':' || (afterColon && (c == ' ' || c == '\t'))
+    if c == '\n' then start := i + 1
+  return .empty
+
+private def Excerpt.append (log : Excerpt) (block : ByteArray) : Excerpt := Id.run do
+  let bytes := log.tail ++ block
+  let overflow := bytes.size - logLimit
+  if overflow == 0 then return { log with tail := bytes }
+  let diagnostic := if log.diagnostic.isEmpty then scrollingDiagnostic bytes overflow else log.diagnostic
+  return { tail := bytes.extract overflow bytes.size, diagnostic }
+
+private def Excerpt.text (log : Excerpt) : String := Id.run do
+  let omitted := "\n[... output omitted ...]\n".toUTF8
+  let bytes := if log.diagnostic.isEmpty then log.tail else
+    let keep := logLimit - omitted.size - log.diagnostic.size
+    log.diagnostic ++ omitted ++ log.tail.extract (log.tail.size - keep) log.tail.size
+  return (String.fromUTF8Lossy bytes).trimAscii.copy
+
+private def readOutput (pipe : IO.FS.Handle) (log : Std.Mutex Excerpt) : IO Unit := do
+  repeat
+    let block ← pipe.read 8192
+    if block.isEmpty then break
+    log.atomically <| modify (·.append block)
+
+abbrev Environment := Array (String × Option String)
+
+def trialEnvironment (target : String) (parent : FilePath) : IO Environment := do
+  let vars ← Std.Internal.UV.System.osEnviron
+  let removed : Environment := vars.filterMap fun (name, _) =>
+    if ["LEAN_", "LAKE_", "GIT_"].any (name.startsWith ·) || name == "LEAN" || name == "LAKE" then
+      some (name, none) else none
+  let added : Array (String × String) := #[("ELAN_TOOLCHAIN", target), ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_CEILING_DIRECTORIES", parent.toString), ("LAKE_NO_CACHE", "true"),
+    ("LAKE_ARTIFACT_CACHE", "false"), ("LAKE_CACHE_DIR", (parent / "cache").toString)]
+  return removed ++ added.map fun (k, v) => (k, some v)
+
+/-- Drain one combined stream while watching the deadline, including when a descendant keeps the
+pipe open after the command exits. Arguments are passed verbatim through the shell's `"$@"`. -/
+def runCommand (args : Array String) (cwd : FilePath) (env : Environment) (timeoutMs : Nat) : IO CommandResult := do
+  let deadline := (← IO.monoMsNow) + timeoutMs
+  let child ← IO.Process.spawn {
+    cmd := "/bin/sh"
+    args := #["-c", "exec \"$@\" 2>&1", "sh"] ++ args
+    cwd, env, stdin := .null, stdout := .piped, stderr := .null, setsid := true }
+  let log ← Std.Mutex.new ({} : Excerpt)
+  let reader ← IO.asTask (readOutput child.stdout log) .dedicated
+  let killGroup : IO IO.Process.Output := IO.Process.output {cmd := "/bin/kill", args := #["-KILL", "--", s!"-{child.pid}"]}
+  let code ← try
+    let mut delay := 1
+    let mut code : Option UInt32 := none
+    repeat
+      if ← IO.hasFinished reader then
+        IO.ofExcept reader.get
+        code ← child.tryWait
+        if code.isSome then
+          break
+      let now ← IO.monoMsNow
+      if now >= deadline then break
+      IO.sleep (min delay (deadline - now)).toUInt32
+      delay := min (2 * delay) 32
+    pure code
+  catch e =>
+    discard killGroup
+    discard child.wait
+    throw e
+  -- Child.kill sends SIGTERM, which build scripts and their descendants may ignore.
+  discard killGroup
+  if code.isNone then
+    discard child.wait
+    -- Give the reader a chance to collect the last pipe buffer after SIGKILL. An escaped process
+    -- can still hold the pipe open, so do not block the timeout result on EOF.
+    for _ in [:20] do
+      if ← IO.hasFinished reader then break
+      IO.sleep 5
+  return {exitCode := code.getD 1, output := (← log.atomically get).text, timedOut := code.isNone}
+
+end LakeCompat.Verify
