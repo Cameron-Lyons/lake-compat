@@ -23,13 +23,13 @@ lake exe lake-compat 4.36.0 --demo
 
 The demo reports `upgradeDemo -> greeting`. The dependency declares Lean 4.35.0, one release behind the target. Copy the executable to a directory on your path to run `lake-compat` directly. Metadata scans work offline. Git is used to read locked commits. A standalone executable built on a compatible platform can scan projects using other Lean toolchains.
 
-To use the command as a Lake dependency in a project on the supported build toolchain, add the following to its `lakefile.toml`. Set `rev` to the native release tag or commit you want to use.
+To use the command as a Lake dependency in a project on the supported build toolchain, add the following to its `lakefile.toml`.
 
 ```toml
 [[require]]
 name = "lake-compat"
 git = "https://github.com/Cameron-Lyons/lake-compat"
-rev = "<native-release-tag-or-commit>"
+rev = "v1.0.0"
 ```
 
 From the project's root, run `lake --keep-toolchain update lake-compat`, then `lake exe lake-compat 4.36.0`. Without `--project`, the command uses the current directory.
@@ -131,6 +131,6 @@ After `lake test`, run `python3 scripts/check-report-schema.py` to validate CLI 
 
 Set the same version in `VERSION` and `lakefile.toml`, then run the **Native release** workflow manually to test packaging without publishing. It builds both archives, runs them on separate runners without a Lean installation step, and uses the Linux archive to check a pinned RealWorld conflict, a live Reservoir lookup, a Git-backed upgrade trial, and downstream installation from Git.
 
-The same workflow runs for a matching `v<VERSION>` tag and publishes the tested archives and checksums after all gates pass. A tag such as `v1.0.0-rc.1` creates a GitHub prerelease. Promote to 1.0.0 after the release candidate passes the checks and any issues are resolved.
+The same workflow runs for a matching `v<VERSION>` tag and publishes the tested archives and checksums after all gates pass. A tag such as `v1.0.0-rc.1` creates a GitHub prerelease. Promote a candidate to a stable release after its checks pass and release-blocking issues are resolved.
 
 Lake-compat is distributed under the Apache License, Version 2.0. [License](LICENSE)

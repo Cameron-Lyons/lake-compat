@@ -1,5 +1,5 @@
 name = "lake-compat"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 description = "Explain and test dependency upgrades in Lean 4 projects"
 keywords = ["lake", "dependencies", "toolchain", "upgrades"]
 license = "Apache-2.0"
