@@ -11,10 +11,12 @@ Explain which locked dependencies need attention for a Lean upgrade.
   --demo                   Scan the bundled example project
   --suggest                Look up candidate revisions on Reservoir
   --verify                 Build the project's default targets on this toolchain
-  --build-target NAME      Build a named Lake target; repeat to build several
+  --test                   Run the project's Lake test driver after a successful build
+  -- ARGS...               With --test, pass remaining arguments to the test driver
+  --build-target TARGET    Build a named target, module source file, or package facet (repeatable)
   --try-suggested          Build a trial with each package's top candidate
   --try-revision NAME=SHA  Try a full Git commit; repeat to combine changes
-  --build-timeout SECONDS  Time allowed for lake build (default: 600 seconds)
+  --build-timeout SECONDS  Time allowed for each build or test step (default 600 seconds)
   --json                   Emit a machine-readable report
   --strict                 Exit 1 if the original lock has metadata findings
   --version                Show the CLI version
@@ -26,6 +28,7 @@ structure Options where
   demo : Bool := false
   suggest : Bool := false
   verify : Bool := false
+  testArgs? : Option (Array String) := none
   buildTargets : Array String := #[]
   trySuggested : Bool := false
   revisions : Array (String × String) := #[]
@@ -34,19 +37,27 @@ structure Options where
   strict : Bool := false
   deriving Inhabited
 
-/-- Qualify named targets so a bare name always selects a target in the root package.
-An explicit package and a facet (e.g. @dep/+Mod:olean) are also accepted. -/
+/-- Pass relative module paths and package facets to Lake. Qualify named targets so
+a bare name selects a target in the root package. -/
 def buildTargetSpec (value : String) : Except String String := do
-  let invalid := "--build-target expects a target name such as MyLib or @package/MyLib"
+  let invalid := "--build-target expects a Lake target such as MyLib, @package/MyLib, src/Main.lean:olean, or :extraDep"
   if value.trimAscii.isEmpty || value.startsWith "-" || value.any (· < ' ') then throw invalid
-  let (pkg, target) ← match value.splitOn "/" with
+  let (base, facet) ← match value.splitOn ":" with
+    | [base] => pure (base, "")
+    | [base, facet] => pure (base, ":" ++ facet)
+    | _ => throw invalid
+  if facet.contains '/' then throw invalid
+  if base.endsWith ".lean" && !base.startsWith "@" && !base.startsWith "+" then
+    if (System.FilePath.mk base).isAbsolute || base.startsWith "../" then throw invalid
+    return value
+  if base.startsWith "./" then throw invalid
+  let (pkg, target) ← match base.splitOn "/" with
     | [name] => do
-      if name.startsWith "@" then throw invalid
-      pure ("", name)
+      if name.startsWith "@" then pure ((name.drop 1).copy, "") else pure ("", name)
     | [pkg, name] => pure ((pkg.dropPrefix "@").copy, name)
     | _ => throw invalid
-  if target.isEmpty || target.startsWith ":" || (target.splitOn ":").length > 2 || pkg.contains ':' then throw invalid
-  return s!"@{pkg}/{target}"
+  if target.isEmpty && (facet.isEmpty || facet == ":") then throw invalid
+  return s!"@{pkg}/{target}{facet}"
 
 private def parsePin (value : String) : Except String (String × String) := do
   let expected := "--try-revision expects PACKAGE=SHA with a full 40- or 64-character Git commit"
@@ -82,6 +93,10 @@ def parseOptions (args : List String) : Except String Options := do
   let mut pending : Option String := none
   for arg in args do
     if positionalOnly then
+      if !opts.target.isEmpty then
+        if let some testArgs := opts.testArgs? then
+          opts := {opts with testArgs? := some (testArgs.push arg)}
+          continue
       opts ← positional opts arg
     else if let some flag := pending then
       if arg.startsWith "-" then throw s!"{flag} requires a value"
@@ -94,6 +109,7 @@ def parseOptions (args : List String) : Except String Options := do
       | "--demo" => opts := {opts with demo := true}
       | "--suggest" => opts := {opts with suggest := true}
       | "--verify" => opts := {opts with verify := true}
+      | "--test" => opts := {opts with verify := true, testArgs? := some #[]}
       | "--try-suggested" => opts := {opts with trySuggested := true}
       | "--json" => opts := {opts with json := true}
       | "--strict" => opts := {opts with strict := true}

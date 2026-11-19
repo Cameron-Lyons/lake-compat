@@ -170,6 +170,22 @@ private def workspaceTargets (project : FilePath) : IO Unit := do
     expectKinds r #["toolchain_mismatch"]
     IO.FS.removeFile vendor
 
+private def newlineLink (project : FilePath) : IO Unit := do
+  if Platform.isWindows then return
+  let repo := packagesDir project / "gitdep"
+  manifest repo
+  pin repo
+  for (dir, version) in [("lib", target), ("lib\n", older)] do
+    manifest (project / dir)
+    pin (project / dir) version
+  link (project / "local") "lib\n"
+  manifest project #[gitDep "gitdep" (← commitMetadata repo), localDep "local" "local"]
+  let out ← cli ((reportArgs project).push "--strict")
+  expect out.exitCode.toNat 1
+  let r ← IO.ofExcept (Json.parse out.stdout)
+  expectKinds r #["toolchain_mismatch"]
+  expectField (← pkg r "local") "checkout" (project / "lib\n").toString
+
 private def cycleDeadline (project : FilePath) : IO Unit := do
   let repo := packagesDir project / "mono"
   pin repo
@@ -248,6 +264,7 @@ def run : IO Unit := do
   runCase "pin inherited at committed link destination" lockedDestination
   runCase "parent after committed link" monorepoParent
   runCase "workspace link targets inside a locked repository" workspaceTargets
+  runCase "workspace symlink target ending in a newline" newlineLink
   runCase "workspace link cycle across a Git boundary" cycleDeadline
   runCase "crossing locked repository boundaries" crossRepository
   runCase "stale checkout with locally available locked commit" staleCommit

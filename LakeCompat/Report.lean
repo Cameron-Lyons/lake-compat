@@ -72,7 +72,8 @@ def render (report : Json) : String := Id.run do
 
   if let .ok check := report.getObjVal? "verification" then
     let status := string check "status"
-    lines := lines.push s!"\nBuild {status}: {string check "message"}"
+    let label := if report.getObjValD "test_requested" == .bool true then "Trial" else "Build"
+    lines := lines.push s!"\n{label} {status}: {string check "message"}"
     if status != "passed" then
       let targets := (rows report "build_targets").filterMap (·.getStr?.toOption)
       unless targets.isEmpty do lines := lines.push ("  Requested targets: " ++ ", ".intercalate targets.toList)

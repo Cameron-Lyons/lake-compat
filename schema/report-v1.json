@@ -22,6 +22,8 @@
           "additionalProperties": { "$ref": "#/$defs/suggestion" }
         },
         "auto_selected": { "const": true },
+        "test_requested": { "const": true },
+        "test_args": { "$ref": "#/$defs/strings" },
         "build_targets": { "$ref": "#/$defs/strings" },
         "trial_revisions": { "$ref": "#/$defs/revisions" },
         "verification": { "$ref": "#/$defs/verification" }
@@ -30,8 +32,16 @@
         "verification": ["trial_revisions"],
         "trial_revisions": ["verification"],
         "build_targets": ["verification"],
+        "test_requested": ["verification"],
+        "test_args": ["test_requested"],
         "auto_selected": ["suggestions", "verification"]
-      }
+      },
+      "if": { "required": ["test_requested"], "properties": {
+        "verification": { "properties": { "status": { "const": "passed" } } }
+      } },
+      "then": { "properties": { "verification": {
+        "required": ["test_exit_code"], "properties": { "test_exit_code": { "const": 0 } }
+      } } }
     }
   ],
   "$defs": {
@@ -107,6 +117,7 @@
         "message": { "type": "string" },
         "output": { "type": "string" },
         "lake_version": { "type": "string" },
+        "test_exit_code": { "type": "integer", "minimum": 0 },
         "checked_revisions": { "$ref": "#/$defs/revisions" }
       },
       "if": { "properties": { "status": { "const": "passed" } } },

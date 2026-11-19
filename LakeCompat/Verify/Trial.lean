@@ -15,6 +15,8 @@ structure Trial where
   packagesDir : FilePath := ".lake/packages"
   copiedPackages : Std.HashSet String := ∅
   gitSubDirs : Array (String × FilePath) := #[]
+  localConfigs : Array FilePath := #["lakefile"]
+  hasModuleCache : Bool := false
   deriving Inhabited
 
 private def parts (p : FilePath) : List String :=
@@ -47,9 +49,8 @@ private def packageCacheDir (path : FilePath) : Except String FilePath := do
 /-- Lake resolves existing local Git remotes before fetching. Anchor a relative remote in the
 original workspace, including when the snapshot omits a nested repository's Git metadata. -/
 private def localGitRemote? (project : FilePath) (url : String) : IO (Option String) := do
-  let path : FilePath := url
-  -- A colon before any slash denotes a Git URL, remote helper, or scp-style address.
-  if path.isAbsolute || (url.takeWhile (· != '/')).contains ':' then return none
+  let some path := Source.localGitPath? url | return none
+  if path.isAbsolute then return none
   let remote := project / path
   unless ← remote.pathExists do return none
   return some (← IO.FS.realPath remote).toString
@@ -81,21 +82,26 @@ private def readTrial (project : FilePath) (revisions : Pins) (expectedManifest 
   let mut paths := #[]
   let mut copiedPackages := ∅
   let mut gitSubDirs := #[]
-  -- Lock.ofJson validated the array if present. Lake defaults an omitted array to empty.
+  let mut localConfigs := #[FilePath.mk "lakefile"]
+  -- Lock.ofJson already validated the package list and its defaults.
   let mut entries := (raw.getObjValD "packages").getArr?.toOption.getD #[]
   for i in [:entries.size] do
     let (kind, fields, tagged) ← IO.ofExcept <| unpackEntry entries[i]!
     let name ← IO.ofExcept <| (fields.getObjValD "name").getStr? >>= packageName
-    for key in [if tagged then "subDir?" else "subDir", "configFile", "manifestFile"] do
-      let value := fields.getObjValD key
-      unless value == .null do discard <| IO.ofExcept <| relative value (name ++ "." ++ key)
+    unless tagged do
+      for key in ["configFile", "manifestFile"] do
+        let value := fields.getObjValD key
+        unless value == .null do discard <| IO.ofExcept <| relative value (name ++ "." ++ key)
     match lock.packages[name]!.source with
     | .path dir copy =>
       paths := paths.push (name, ← IO.ofExcept <| relative (.str dir) (name ++ ".dir"))
+      let config := if tagged then "lakefile" else (fields.getObjValD "configFile").getStr?.toOption.getD "lakefile"
+      localConfigs := localConfigs.push (FilePath.mk dir / config)
       if copy then copiedPackages := copiedPackages.insert name
     | .git url rev subDir _ =>
       if let some subDir := subDir then
-        gitSubDirs := gitSubDirs.push (name, ⟨subDir⟩)
+        let dir ← IO.ofExcept <| relative (.str subDir) (name ++ ".subDir")
+        gitSubDirs := gitSubDirs.push (name, dir)
       let revision := revisions[name]?.getD rev
       unless Source.isFullRevision revision do
         throw <| IO.userError s!"{name} needs a full 40- or 64-character Git commit in the trial manifest."
@@ -111,7 +117,7 @@ private def readTrial (project : FilePath) (revisions : Pins) (expectedManifest 
   unless unknown.isEmpty do
     throw <| IO.userError s!"Trial revisions must name locked Git packages: {String.intercalate ", " unknown}."
   let manifest := if entries.isEmpty then raw else raw.setObjVal! "packages" (.arr entries)
-  return ({manifest, packagesDir, pins, paths, copiedPackages, gitSubDirs}, contents)
+  return ({manifest, packagesDir, pins, paths, copiedPackages, gitSubDirs, localConfigs}, contents)
 
 /-- Keep the original JSON representation so future Lake fields, tagged entries and package order
 survive trial revision edits. -/
@@ -136,7 +142,8 @@ def prepareTrial (project workspace : FilePath) (revisions : Pins) (configuredDi
   if !managed.isEmpty && (trial.manifest.getObjValD "packagesDir").isNull then
     let dir ← IO.ofExcept <| packageCacheDir (← configuredDir)
     trial := {trial with packagesDir := dir, manifest := trial.manifest.setObjVal! "packagesDir" (.str dir.toString)}
-  copySources project workspace trial.packagesDir managed
+  let hasModuleCache ← copyTrialSources project workspace trial.packagesDir managed
+  trial := { trial with hasModuleCache }
   if (← IO.FS.readFile (workspace / manifestName)) != contents then
     throw <| IO.userError "The project manifest changed while taking the source snapshot."
   if (← hasCaseAliases workspace) then

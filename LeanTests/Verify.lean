@@ -20,8 +20,12 @@ private def isolation : IO Unit := withProject fun project => do
 
 private def outcomes : IO Unit := withProject fun project => do
   expect (← trial project "change-lock") "inconclusive" "changed"
+  expect (← trial project "invalid-lock") "inconclusive" "changed"
+  expect (← trial project "missing-toolchain") "inconclusive" "changed"
+  expect (← trial project "reformat-lock") "passed"
   expect (← trial project "check-change") "inconclusive" "changed"
   expect (← trial project "overrides") "inconclusive" "overrides"
+  expect (← trial project "empty-overrides") "passed"
   expect (← trial project "check-empty") "inconclusive"
   expect (← trial project "no-elan") "unavailable"
   let missing ← trial project "uninstalled"
@@ -34,7 +38,17 @@ private def outcomes : IO Unit := withProject fun project => do
   let binary ← trial project "binary-log"
   expect binary "failed"
   let output := field binary "output"
-  check (output.utf8ByteSize ≤ LakeCompat.Verify.logLimit && output.endsWith "build failed") "unbounded binary log"
+  check (output.utf8ByteSize ≤ LakeCompat.Verify.logLimit && output.startsWith "error: binary compiler output" &&
+    output.endsWith "build failed") "lost diagnostic or final summary while bounding binary log"
+  let unicode ← trial project "unicode-tail"
+  expect unicode "failed"
+  check (field unicode "output" == LakeCompat.Verify.boundedLogTail (String.ofList (List.replicate 5000 '😇') ++ "X"))
+    "truncation corrupted a valid UTF-8 character"
+  let compact ← trial project "compact-diagnostic"
+  expect compact "failed"
+  let output := field compact "output"
+  check (output.utf8ByteSize ≤ LakeCompat.Verify.logLimit && output.startsWith "Main.lean:3:8:error: invalid type\n  expected Nat" &&
+    output.endsWith "build failed") "lost compiler diagnostic split across reads"
   let diag ← trial project "diagnostic"
   expect diag "failed"
   let output := field diag "output"
@@ -71,13 +85,21 @@ private def localPaths : IO Unit := withProject fun project => do
   writeJson lock (manifest)
   write (project / ".lake/package-overrides.json") "{}"
   expect (← trial project) "inconclusive" "overrides"
+  writeJson (project / ".lake/package-overrides.json") (manifest)
+  expect (← trial project) "passed"
+  writeJson (project / ".lake/package-overrides.json") (manifest #[pathEntry "dep" "sources"])
+  expect (← trial project) "inconclusive" "overrides"
 
 private def validLinks : IO Unit := withProject fun project => do
   write (project / "lib/Shared.lean") "shared input"
   link "lib" (project / "lib-link")
   link "lib-link/Shared.lean" (project / "shared")
   link "../Main.lean" (project / "lib/main-link")
+  write (project / "lib/line\n") "linked input"
+  link "lib/line\n" (project / "newline-link")
   expect (← trial project "links") "passed"
+  write (project / "lib/line\nbreak") "linked input"
+  link "lib/line\nbreak" (project / "multiline-link")
   for (file, backup) in [("lean-toolchain", "original-toolchain"), ("lake-manifest.json", "original-lock")] do
     IO.FS.rename (project / file) (project / backup)
     link backup (project / file)
@@ -155,6 +177,7 @@ private def checkoutPins : IO Unit := withProject fun project => do
   check (result.getObjValD "checked_revisions" == pins && (← readJson file) == lock "postgres") result.compress
   expect (← trial project "clone") "inconclusive" "locked revision"
   expect (← trial project "dirty" pins) "inconclusive" "tracked files"
+  expect (← trial project "staged" pins) "passed"
   writeJson file (lock "core/lakefile.lean")
   expect (← trial project "clone" pins) "inconclusive" "package directory"
 

@@ -25,12 +25,23 @@ def isolatedDirectory (root relative : FilePath) : IO (Option FilePath) := do
     unless (← metadata? path).any (·.type == .dir) do return none
   return some (← IO.FS.realPath path)
 
+private def readLinkTargets (links : Array (FilePath × UInt64)) : IO (Array String) := do
+  if links.size > 1 then
+    let cmd := IO.Process.run {cmd := "readlink", args := links.map (·.1.toString)}
+    if let .ok raw ← cmd.toBaseIO then
+      let targets := ((raw.dropSuffix "\n").copy.splitOn "\n").toArray
+      -- BSD readlink also uses a target's own final newline as the output separator.
+      if targets.size == links.size && (targets.zip links).all (fun (target, _, n) => target.utf8ByteSize == n.toNat) then
+        return targets
+  -- Ask for the exact bytes when a target contains a newline or multiple operands are unsupported.
+  links.mapM fun (link, _) => do
+    try IO.Process.run {cmd := "readlink", args := #["-n", link.toString]}
+    catch e => throw <| IO.userError s!"Cannot read source symlink {link}: {e}"
+
 /-- Resolve each component of a copied symlink so even an intermediate escape followed by ".."
-is rejected. The snapshot has stopped changing before links are inspected. -/
-private def linkTarget (root link : FilePath) : IO FilePath := do
+is rejected. Return its directory target, if any, for the cycle check. -/
+private def directoryTarget? (root link path : FilePath) : IO (Option FilePath) := do
   try
-    let raw ← IO.Process.run {cmd := "readlink", args := #[link.toString]}
-    let path : FilePath := (raw.dropSuffix "\n").copy
     if path.isAbsolute then throw <| IO.userError "absolute path"
     let mut current := link.parent.getD root
     for part in path.components do
@@ -41,8 +52,7 @@ private def linkTarget (root link : FilePath) : IO FilePath := do
       if (current.components.drop root.components.length).any excluded then
         throw <| IO.userError "uses an excluded directory"
     -- Also enforce the OS traversal rules, including a trailing slash on a non-directory.
-    discard link.metadata
-    return current
+    return if (← link.metadata).type == .dir then some current else none
   catch e => throw <| IO.userError s!"Cannot isolate source symlink {link}: {e}"
 
 private abbrev Edges := Std.HashMap FilePath (Array FilePath)
@@ -66,34 +76,41 @@ private def checkDirectoryCycles (edges : Edges) : IO Unit := do
 private def validateSnapshot (root : FilePath) : IO Unit := do
   let mut stack := #[root]
   let mut edges : Edges := ∅
-  let mut directoryLinks := false
+  let mut links := #[]
   while let some dir := stack.back? do
     stack := stack.pop
     let mut children := #[]
     for entry in ← dir.readDir do
-      match (← entry.path.symlinkMetadata).type with
+      let info ← entry.path.symlinkMetadata
+      match info.type with
       | .file => pure ()
       | .dir =>
         stack := stack.push entry.path
         children := children.push entry.path
-      | .symlink =>
-        let resolved ← linkTarget root entry.path
-        if ← resolved.isDir then
-          children := children.push resolved
-          directoryLinks := true
+      | .symlink => links := links.push (entry.path, info.byteSize)
       | .other => throw <| IO.userError s!"Cannot isolate a special file: {entry.path}."
     edges := edges.insert dir children
+  let mut directoryLinks := false
+  for start in [0:links.size:32] do
+    let batch := links.extract start (start + 32)
+    for (link, _) in batch, target in ← readLinkTargets batch do
+      if let some dir ← directoryTarget? root link ⟨target⟩ then
+        edges := edges.modify link.parent.get! (·.push dir)
+        directoryLinks := true
   if directoryLinks then checkDirectoryCycles edges
 
 private def copyBatches (batches : Array (Array String × FilePath)) : IO Unit := do
   -- Each batch has distinct destination files. cp preserves modes and copies links verbatim.
+  -- macOS cp can clone data on copy-on-write volumes and falls back to copying otherwise.
+  let (cmd, flags) := if Platform.isOSX then ("/bin/cp", #["-c", "-Pp"]) else ("cp", #["-Pp"])
   discard <| mapConcurrent batches fun (files, toDir) => do
-    discard <| IO.Process.run {cmd := "cp", args := (#["-Pp"] ++ files).push toDir.toString}
+    discard <| IO.Process.run {cmd, args := (flags ++ files).push toDir.toString}
 
 def sourceByteLimit := 1024 ^ 3
 
-def copySources (source destination : FilePath) (packagesDir : FilePath := ".lake/packages")
-    (managedPackages : Std.HashSet String := ∅) : IO Unit := do
+/-- Copy the trial sources and report whether they include previously compiled Lean modules. -/
+def copyTrialSources (source destination packagesDir : FilePath)
+    (managedPackages : Std.HashSet String) : IO Bool := do
   if isInside source destination then throw <| IO.userError "The temporary directory must be outside the project."
   let packageCache ← if managedPackages.isEmpty then pure none else isolatedDirectory source packagesDir
   let foldedNames := managedPackages.fold (init := (∅ : Std.HashMap String String)) fun m name =>
@@ -101,6 +118,7 @@ def copySources (source destination : FilePath) (packagesDir : FilePath := ".lak
   IO.FS.createDir destination
   let mut stack := #[(source, destination)]
   let mut totalBytes := 0
+  let mut hasModuleCache := false
   let mut batches := #[]
   while let some (dir, toDir) := stack.back? do
     stack := stack.pop
@@ -131,6 +149,9 @@ def copySources (source destination : FilePath) (packagesDir : FilePath := ".lak
         stack := stack.push (entry.path, subDir)
       | .other => throw <| IO.userError s!"Cannot isolate a special file: {entry.path}."
       | .file | .symlink =>
+        if !hasModuleCache then
+          hasModuleCache := entry.fileName.endsWith ".ltar" || (entry.fileName.endsWith ".olean" &&
+            onDisk.get.contains ((entry.fileName.dropSuffix ".olean").copy ++ ".trace"))
         if info.type == .file then
           totalBytes := totalBytes + info.byteSize.toNat
           if totalBytes > sourceByteLimit then throw <| IO.userError "Project sources exceed the 1 GiB temporary-copy limit."
@@ -143,5 +164,10 @@ def copySources (source destination : FilePath) (packagesDir : FilePath := ".lak
     unless files.isEmpty do batches := batches.push (files, toDir)
   copyBatches batches
   validateSnapshot destination
+  return hasModuleCache
+
+def copySources (source destination : FilePath) (packagesDir : FilePath := ".lake/packages")
+    (managedPackages : Std.HashSet String := ∅) : IO Unit :=
+  discard <| copyTrialSources source destination packagesDir managedPackages
 
 end LakeCompat.Verify

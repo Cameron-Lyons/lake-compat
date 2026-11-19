@@ -85,8 +85,11 @@ private def scan (opts : Options) (project : FilePath) : IO Json := do
   if opts.verify || opts.trySuggested || !pins.isEmpty then
     let timeout := opts.buildTimeoutSeconds.getD defaultBuildTimeoutSeconds
     let result ← verifyBuild project (Report.string report "target") pins.toArray (timeout * 1000)
-      (some manifest) opts.buildTargets
+      (some manifest) opts.buildTargets (testArgs? := opts.testArgs?)
     if !opts.buildTargets.isEmpty then report := report.setObjVal! "build_targets" (toJson opts.buildTargets)
+    if let some args := opts.testArgs? then
+      report := report.setObjVal! "test_requested" true
+      unless args.isEmpty do report := report.setObjVal! "test_args" (toJson args)
     report := (report.setObjVal! "verification" result).setObjVal! "trial_revisions"
       (Json.mkObj (pins.toList.map fun (k, v) => (k, .str v)))
   return if opts.demo then displayDemo project report else report

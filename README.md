@@ -38,6 +38,8 @@ From the project's root, run `lake --keep-toolchain update lake-compat`, then `l
 
 The scan reads the project's `lake-manifest.json`, including legacy versions 5–7 and current 1.x manifests. It reads each Git dependency's toolchain and manifest from its locked commit whenever that commit is present locally. If the checkout points at a different commit, the report also flags the mismatch. Local path dependencies use the working tree until their paths enter a locked Git checkout. Scans with Git dependencies use `readlink` on POSIX or Windows PowerShell to follow workspace symlinks in those paths. Missing checkouts and unverifiable Git revisions appear as findings, including in `--strict` mode. On a fresh checkout, an ordinary `lake build` on the project's current toolchain materializes its dependencies.
 
+For a nested Lake project, the scan uses the nearest `lean-toolchain` in the project or its parent directories. Local packages under that directory inherit the same pin unless a closer file overrides it. Locked Git packages resolve their pins within their own commits.
+
 For example, in the Lean RealWorld application, `realworld -> jose -> json` identifies the dependency that selected a different JSON revision. The diagnostic includes both full commits. A mismatch is a reason to test the combination. The application may already build with that override. [RealWorld dependency configuration](https://github.com/saviorand/lean-realworld-example-app/tree/483d47e1d3c797098ac55cbf23a95072f7a6b6e5)
 
 ## Try an upgrade
@@ -46,6 +48,7 @@ For example, in the Lean RealWorld application, `realworld -> jose -> json` iden
 | --- | --- |
 | `lake-compat 4.36.0 --suggest` | Look up alternative revisions for flagged Git packages and the parents involved in conflicts. |
 | `lake-compat 4.36.0 --verify` | Build the current locked revisions using the target toolchain. |
+| `lake-compat 4.36.0 --test` | Build the project and run its configured Lake test driver in the same trial. |
 | `lake-compat 4.36.0 --build-target MyLib --build-target MyExe` | Build both named targets in one trial. This also works for projects with no default targets. |
 | `lake-compat 4.36.0 --try-suggested` | Pick the top candidate for each package with a match and build that combination in a temporary copy. Packages without candidates keep their current pins. |
 | `lake-compat 4.36.0 --try-revision "Cli=$CLI_COMMIT"` | Test a specific full Git SHA. Repeat the option to test several changes together. Explicit choices take precedence over automatic choices. |
@@ -53,31 +56,35 @@ For example, in the Lean RealWorld application, `realworld -> jose -> json` iden
 
 Suggestions use `curl` to query Reservoir for indexed GitHub repositories. The lookup checks the package's repository, subdirectory, and exact target toolchain. It prefers successful recorded builds and flags any that required a dependency update. It also lists revisions that declare the target when build evidence is unavailable. If only one history can be retrieved, the report labels each candidate with its available evidence. In JSON, `unavailable_history` identifies the missing `builds` or `versions` history. A lookup with incomplete history and no candidates is reported as unavailable. [Reservoir](https://reservoir.lean-lang.org/)
 
-Build trials require Git, a POSIX host, and the target already installed in elan. For example, `elan toolchain install leanprover/lean4:v4.36.0` makes that toolchain available. A trial copies the working source, including uncommitted project edits, into a temporary directory, sets the toolchain and selected pins there, and runs Lake. By default it builds the project's default targets. Each `--build-target` selects a named target for that trial. A bare name selects a target in the root package. Use `@package/Name` for a dependency target or `@package/+Module:olean` for a module facet. You can combine these selections with `--try-revision` or `--try-suggested`. The JSON field `build_targets` records explicit selections.
+Build trials require Git, a POSIX host, and the target already installed in elan. For example, `elan toolchain install leanprover/lean4:v4.36.0` makes that toolchain available. A trial copies the working source, including uncommitted project edits, into a temporary directory, sets the toolchain and selected pins there, and runs Lake. Without an explicit target, it builds the project's default targets.
 
-Lake can fetch dependencies and execute project and dependency build scripts with your permissions. Git dependencies come from the locked commits. A relative Git URL such as `../greeting` is resolved from the original project so the trial can fetch the same local repository. The root snapshot omits `.git` and Lake caches, so a build step that needs the root repository's history can fail in the trial.
+Repeat `--build-target` to select targets for a trial. A bare name selects a target in the root package. Use `@package/Name` for a dependency target or `@package/+Module:olean` for a module facet. To select a module by source file, use a project-relative path such as `--build-target Main.lean:olean` or `--build-target src/Main.lean:olean`. Paths beginning with `./` also work. For a package facet, use `:facet` for the root or `@package:facet` for a dependency. You can combine these selections with `--try-revision` or `--try-suggested`. The JSON field `build_targets` records explicit selections.
+
+Use `--test` to run `lake test` after the build. It also works with `--try-revision`, `--try-suggested`, and named targets. For an executable or script driver, put its arguments after `--`, for example `lake-compat 4.36.0 --test -- --filter "parser smoke"`. Lake appends those arguments to the project’s configured `testDriverArgs`. A library driver takes no arguments. A project with a test driver can use this mode even if it has no default build targets. A failing test driver fails the trial. If Lake cannot confirm a configured driver, the trial is inconclusive.
+
+Lake can fetch dependencies and execute project and dependency build scripts with your permissions. Git dependencies come from the locked commits. A relative Git URL such as `../greeting` is resolved from the original project so the trial can fetch the same local repository. The root snapshot omits `.git` and `.lake`, so a build step that needs the root repository's history can fail in the trial. For custom or executable Lake configurations, the target Lake reports the packages’ build, library, binary, and intermediate directories before compilation. A directory outside the temporary project makes verification inconclusive. In-tree output paths can contain spaces or colons. When a custom directory contains compiled modules from the working copy, the verifier invalidates their Lake traces in the trial so Lake rebuilds the requested modules.
 
 The trial starts from the lock used for the metadata scan. If that lock changes before the snapshot, verification reports an inconclusive result. A successful trial checks that Lake retained the trial manifest and toolchain and that the resulting Git checkouts match every expected revision. With `--json`, `trial_revisions` lists requested changes and `verification.checked_revisions` records the full set of Git pins in a passing build. To adopt a passing trial, update `lean-toolchain` and the relevant requirements in your project's `lakefile.toml` or `lakefile.lean`, regenerate the manifest with Lake, and verify the resulting lock.
 
-Automatic trials test one combination and hold the dependency graph fixed. If an upgrade adds a dependency, use Lake to resolve that changed graph on an upgrade branch. The verifier supports the standard `.lake` metadata directory, in-tree package directories, in-tree path dependencies, and relative symlinks within the copied source. Lake materializes fresh checkouts in the trial's package directory. If you keep other source files alongside those checkouts in a directory such as `vendor/`, the trial copies them too. External path dependencies, package overrides, and links that cannot be reproduced in the snapshot yield an inconclusive result.
+Automatic trials test one combination and hold the dependency graph fixed. If an upgrade adds a dependency, use Lake to resolve that changed graph on an upgrade branch. The verifier supports the standard `.lake` metadata directory, in-tree package directories, in-tree path dependencies, and relative symlinks within the copied source. Lake materializes fresh checkouts in the trial's package directory. If you keep other source files alongside those checkouts in a directory such as `vendor/`, the trial copies them too. External path dependencies, active or unreadable package overrides, and links that cannot be reproduced in the snapshot yield an inconclusive result. A valid override manifest with an empty package list leaves the root lock in effect.
 
 If a manifest omits `packagesDir`, an offline scan looks for checkouts in the default packages directory. For build trials with Git or copied dependencies, the target Lake must support `translate-config` to resolve the omitted directory in a temporary copy. The trial records the resulting project-relative path before fetching or copying packages.
 
-The source snapshot limit is 1 GiB. The `lake build` step has a ten-minute timeout by default. Use `--build-timeout SECONDS` with any build trial to change it. For example, `lake-compat 4.36.0 --verify --build-timeout 1800` allows half an hour for compilation.
+The source snapshot limit is 1 GiB. The build and optional test step each have a ten-minute timeout by default. Use `--build-timeout SECONDS` with any build trial to change it. For example, `lake-compat 4.36.0 --verify --build-timeout 1800` allows half an hour for compilation.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Report completed, and any requested build passed. |
-| 1 | The build failed, or `--strict` found metadata issues in the original lock. |
+| 0 | Report completed, and any requested build and tests passed. |
+| 1 | A build or test failed, or `--strict` found metadata issues in the original lock. |
 | 2 | Input was invalid, the build toolchain was unavailable, or verification was inconclusive. |
 
-Package metadata findings always describe the project's original lock. A passing trial can therefore exit 1 under `--strict`. An unavailable or inconclusive trial exits 2 even when `--strict` also finds issues. Suggestions alone leave the exit code unchanged. Project-specific tests can be run separately after adopting the pins.
+Package metadata findings always describe the project's original lock. A passing trial can therefore exit 1 under `--strict`. An unavailable or inconclusive trial exits 2 even when `--strict` also finds issues. Suggestions alone leave the exit code unchanged.
 
 ## JSON contract
 
-`--json` emits one object on stdout with `schema_version: 1`. A scan includes `project`, `target`, `root_toolchain`, `packages`, and `findings`. Input and scan errors return an `error` string and exit 2. Suggestions appear when requested. Trials include `trial_revisions` and `verification`, whose status is `passed`, `failed`, `unavailable`, or `inconclusive`. A passed trial includes `checked_revisions`, even when the set of Git pins is empty. [JSON Schema](schema/report-v1.json)
+`--json` emits one object on stdout with `schema_version: 1`. A scan includes `project`, `target`, `root_toolchain`, `packages`, and `findings`. Input and scan errors return an `error` string and exit 2. Suggestions appear when requested. Trials include `trial_revisions` and `verification`, whose status is `passed`, `failed`, `unavailable`, or `inconclusive`. A passed trial includes `checked_revisions`, even when the set of Git pins is empty. With `--test`, the report includes `test_requested: true`. When arguments follow `--`, `test_args` records them in order. Once `lake test` finishes, `verification.test_exit_code` records its exit code. [JSON Schema](schema/report-v1.json)
 
 Use finding `kind` for automation. The current kinds are:
 

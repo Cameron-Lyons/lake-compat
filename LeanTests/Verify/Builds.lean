@@ -13,6 +13,102 @@ private def implicitEmpty (target : String) : IO Unit := withProject fun project
   expect result "passed"
   check (result.getObjValD "checked_revisions" == Json.mkObj []) result.compress
 
+private def staleModuleCache (target : String) : IO Unit := withProject fun project => do
+  write (project / "lakefile.toml") (appConfig ++ "buildDir = \"out dir\"\nleanLibDir = \"objects\"\n" ++ mainLibrary)
+  let objects := project / "out dir/objects"
+  write (objects / "Notes.trace") "source data"
+  write (objects / "Notes.olean") "fixture"
+  IO.FS.writeBinFile (objects / "Binary.trace") ⟨#[255, 0, 253]⟩
+  write (objects / "Binary.olean") "fixture"
+  write (project / "message.txt") "original"
+  let source := "example : (include_str \"message.txt\") = \"original\" := rfl\n" ++
+    "example : (include_str \"out dir/objects/Notes.trace\") = \"source data\" := rfl\n"
+  write (project / "Main.lean") source
+  discard <| IO.Process.run {cmd := "elan", args := #["run", target, "lake", "build"], cwd := project}
+  let trace ← IO.FS.readBinFile (objects / "Main.trace")
+  let olean ← IO.FS.readBinFile (objects / "Main.olean")
+  -- Module-shaped outputs alone do not make a source fixture a valid build trace.
+  let imitation := (← readJson (objects / "Main.trace")).setObjVal! "log" "fixture"
+  writeJson (objects / "Example.trace") imitation
+  -- A copy of genuine Lake metadata outside the active output directory can also be source data.
+  IO.FS.createDir (project / "fixtures")
+  IO.FS.writeBinFile (project / "fixtures/Main.trace") trace
+  IO.FS.writeBinFile (project / "fixtures/Main.olean") olean
+  write (project / "message.txt") "changed"
+  let failed ← trial project (target := target)
+  expect failed "failed"
+  check ((field failed "output").contains "Main.lean") failed.compress
+  check ((← IO.FS.readBinFile (objects / "Main.trace")) == trace &&
+    (← IO.FS.readBinFile (objects / "Main.olean")) == olean) "changed the original build cache"
+  write (project / "message.txt") "original"
+  write (project / "Main.lean") (source ++ "def savedTrace := include_str \"fixtures/Main.trace\"\n" ++
+    "def exampleTrace := include_str \"out dir/objects/Example.trace\"\n")
+  expect (← trial project (target := target)) "passed"
+  discard <| IO.Process.run {cmd := "elan", args := #["run", target, "lake", "build", "+Main:ltar"], cwd := project}
+  IO.FS.removeFile (objects / "Main.olean")
+  -- Leave only the packed module as reusable output, including in the snapshot detector.
+  for path in [objects / "Notes.olean", objects / "Binary.olean", project / "fixtures/Main.olean"] do
+    IO.FS.removeFile path
+  write (project / "message.txt") "changed"
+  let archived ← trial project (target := target)
+  expect archived "failed"
+  check (!(← (objects / "Main.olean").pathExists)) "unpacked the module archive in the original project"
+  write (project / "lakefile.toml") "invalid toml"
+  expect (← trial project (target := target)) "failed"
+
+private def moduleCacheWithColon (target : String) : IO Unit := withProject fun project => do
+  write (project / "lakefile.toml") (appConfig ++ "buildDir = \"out:/cache\"\n" ++ mainLibrary)
+  write (project / "message.txt") "original"
+  write (project / "Main.lean") "example : (include_str \"message.txt\") = \"original\" := rfl\n"
+  discard <| IO.Process.run {cmd := "elan", args := #["run", target, "lake", "build"], cwd := project}
+  write (project / "message.txt") "changed"
+  let result ← trial project (target := target)
+  expect result "failed"
+  check ((field result "output").contains "Main.lean") result.compress
+  write (project / "message.txt") "original"
+  expect (← trial project (target := target)) "passed"
+
+private def externalOutputs (target : String) : IO Unit := withProject fun project => do
+  let external := project.parent.get! / "external outputs"
+  write (external / "keep") "original"
+  write (project / "Main.lean") "def main : IO Unit := pure ()\n"
+  write (project / "Core.lean") "def value := 5\n"
+  let lock := project / "lake-manifest.json"
+  let original ← IO.FS.readBinFile lock
+  for key in ["buildDir", "leanLibDir", "nativeLibDir", "irDir", "binDir"] do
+    let config := "name = \"app\"\ndefaultTargets = [\"app\", \"Core\"]\n" ++
+      s!"{key} = {(Json.str external.toString).compress}\n" ++
+      "[[lean_lib]]\nname = \"Core\"\ndefaultFacets = [\"static\"]\n" ++
+      "[[lean_exe]]\nname = \"app\"\nroot = \"Main\"\n"
+    write (project / "lakefile.toml") config
+    expect (← trial project (target := target)) "inconclusive"
+    check ((← external.readDir).size == 1 && (← IO.FS.readFile (external / "keep")) == "original")
+      s!"Lake wrote to the external {key}"
+  check (!(← (project / ".lake").pathExists) && (← IO.FS.readBinFile lock) == original)
+    "external output trial changed the original project"
+
+private def dependencyOutput (target : String) : IO Unit := withProject fun project => do
+  let dep := project / "dep"
+  let external := project.parent.get! / "dependency outputs"
+  write (project / "lakefile.toml") (appConfig ++ mainLibrary ++
+    "[[require]]\nname = \"dep\"\npath = \"dep\"\n")
+  write (project / "Main.lean") "import Dep\nexample : message = 5 := rfl\n"
+  write (dep / "lakefile.lean") ("import Lake\nopen Lake DSL\npackage dep where\n" ++
+    "  buildDir := System.FilePath.mk (include_str \"output.txt\")\nlean_lib Dep\n")
+  write (dep / "Dep.lean") "def message := 5\n"
+  let entry := (pathEntry "dep" "dep").setObjVal! "configFile" "lakefile.lean"
+  let lock := project / "lake-manifest.json"
+  writeJson lock (manifest #[entry])
+  let original ← IO.FS.readBinFile lock
+  write (dep / "output.txt") external.toString
+  expect (← trial project (target := target)) "inconclusive"
+  check (!(← external.pathExists)) "Lake created the dependency's external output directory"
+  write (dep / "output.txt") "in-tree outputs"
+  expect (← trial project (target := target)) "passed"
+  for path in [project / ".lake", dep / ".lake", dep / "in-tree outputs"] do
+    check (!(← path.pathExists)) s!"Lake wrote to the original project at {path}"
+  check ((← IO.FS.readBinFile lock) == original) "dependency output trial changed the original lock"
+
 private def customCache (target : String) : IO Unit := withProject fun project => do
   let root := project.parent.get!
   let repo := root / "greeting"
@@ -53,6 +149,17 @@ private def customCache (target : String) : IO Unit := withProject fun project =
       check ((← IO.FS.readFile (checkout / "Greeting.lean")) == "local edits\n") "changed working checkout"
     else
       check (!(← checkout.pathExists)) "created a checkout in the user's package cache"
+  -- A newly fetched revision can turn an in-tree output path into an external symlink.
+  let external := root / "external output"
+  IO.FS.createDir external
+  link external.toString (repo / "outputs")
+  let config := repo / "lakefile.toml"
+  write config ("buildDir = \"outputs/future\"\n" ++ (← IO.FS.readFile config))
+  discard <| git repo #["add", "outputs", "lakefile.toml"]
+  discard <| git repo #["commit", "-qm", "linked output"]
+  let candidate := Json.mkObj [("greeting", .str (← git repo #["rev-parse", "HEAD"]))]
+  expect (← trial project (pins := candidate) (target := target)) "inconclusive" "outside the trial workspace"
+  check (← external.readDir).isEmpty "build wrote through the locked Git symlink"
   -- Keep the lock spelling while the checkout and cache use another case on disk.
   if ← (project / "VENDOR/GREETING").pathExists then
     IO.FS.rename checkout (project / "vendor/Greeting")
@@ -111,6 +218,10 @@ def realBuilds : IO Unit := do
     IO.println s!"Skipping real build verification fixtures; elan toolchain {target} is unavailable."
     return
   implicitEmpty target
+  staleModuleCache target
+  moduleCacheWithColon target
+  externalOutputs target
+  dependencyOutput target
   customCache target
   copiedCache target
   implicitExternalCache target

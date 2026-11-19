@@ -1,4 +1,5 @@
 import LeanTests.Graph.Fixture
+import Init.System.Uri
 
 open Lean System LeanTests.Support
 
@@ -63,6 +64,31 @@ private def localEdits (project : FilePath) : IO Unit := do
   manifest project #[localDep "local" "local"]
   pin source
   expectKinds (← report project) #[]
+
+private def localRemotes (project : FilePath) : IO Unit := do
+  let parent := project / "parent"
+  let remote := project / "remotes/leaf %20é"
+  manifest (remote / "lib")
+  pin remote
+  link (remote / "alias") "lib"
+  let revision ← commitMetadata remote
+  let other := parent / "remotes/leaf"
+  for checkout in [packagesDir project / "leaf", other] do
+    IO.FS.createDirAll checkout.parent.get!
+    discard <| git project #["clone", "-q", remote.toString, checkout.toString]
+  let dependency := fun (url subDir : String) inherited =>
+    gitDep "leaf" revision inherited [("url", url), ("subDir", subDir)]
+  manifest parent #[dependency "./remotes/leaf %20é" "alias" false]
+  for (url, kinds) in [(remote.toString, #[]), (other.toString, #["source_conflict"])] do
+    manifest project #[localDep "parent" "parent", dependency url "lib" true]
+    expectKinds (← report project) kinds
+  let uri := Uri.pathToUri remote
+  expect (← git project #["ls-remote", uri, "HEAD"]) (revision ++ "\tHEAD")
+  manifest project #[localDep "parent" "parent", dependency remote.toString "lib" true]
+  for (url, kinds) in [(uri, #[]), (uri.replace "file:///" "file://localhost/", #[]),
+      (Uri.pathToUri other, #["source_conflict"]), (uri ++ "%FF", #["source_conflict"])] do
+    manifest parent #[dependency url "alias" false]
+    expectKinds (← report project) kinds
 
 private def untrackedMetadata (project : FilePath) : IO Unit := do
   let repo := packagesDir project / "group"
@@ -142,16 +168,41 @@ private def unbornHead (project : FilePath) : IO Unit := do
   expectField (← pkg r "lib") "toolchain" older
   expectKinds r #["unknown_checkout_revision", "toolchain_mismatch"]
 
+private def legacyCatFile (project : FilePath) : IO Unit := do
+  if Platform.isWindows then return
+  let repo := packagesDir project / "dep"
+  manifest repo
+  pin repo "4.24.0"
+  let locked ← commitMetadata repo
+  pin repo
+  discard <| git repo #["commit", "-qam", "newer pin"]
+  manifest project #[gitDep "dep" locked]
+  let tools := project / "bin"
+  let shim := tools / "git"
+  IO.FS.createDir tools
+  IO.FS.writeFile shim <|
+    "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = --batch-command ]; then exit 129; fi\ndone\nexec \"$TEST_REAL_GIT\" \"$@\"\n"
+  IO.setAccessRights shim {user := {read := true, write := true, execution := true}}
+  let gitPath ← IO.Process.run {cmd := "/bin/sh", args := #["-c", "command -v git"]}
+  let path := tools.toString ++ ":" ++ (← IO.getEnv "PATH").getD ""
+  let out ← cli (reportArgs project) #[("TEST_REAL_GIT", some gitPath.trimAscii.copy), ("PATH", some path)]
+  expect out.exitCode.toNat 0
+  let r ← IO.ofExcept (Json.parse out.stdout)
+  expectKinds r #["checkout_revision_mismatch", "toolchain_mismatch"]
+  expectField (← pkg r "dep") "toolchain" older
+
 def run : IO Unit := do
   runCase "dirty and deleted locked metadata" dirtyCheckout
   runCase "archive provenance" archive
   runCase "archive boundary" archiveBoundary
   runCase "incomplete checkout in another repository" incompleteCheckout
   runCase "working tree of path dependency" localEdits
+  runCase "workspace-relative and absolute Git remotes" localRemotes
   runCase "ignored and untracked committed package metadata" untrackedMetadata
   runCase "linked Git worktree" linkedWorktree
   runCase "SHA-256 tree with custom manifest name" sha256Tree
   runCase "wrong checkout" wrongCheckout
   runCase "unborn HEAD" unbornHead
+  runCase "Git without batch-command support" legacyCatFile
 
 end LeanTests.Graph.Revisions
