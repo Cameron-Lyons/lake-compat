@@ -71,7 +71,8 @@ private def inputErrors : IO Unit := withProject fun project => do
   for args in [#["--demo"], #["--try-revision", "lib=main"], #["--unknown"], #["--project="],
       #["--build-timeout"], #["--build-timeout", "0"], #["--build-timeout=0.5"],
       #["--build-target"], #["--build-target="], #["--build-target=--help"], #["--build-target", "@dep/"],
-      #["--build-target", "CoreLib:olean:extra"],
+      #["--build-target", "CoreLib:olean:extra"], #["--build-target", "./CoreLib.lean:olean:extra"],
+      #["--build-target", "./CoreLib.toml"], #["--build-target", "@dep:"], #["--build-target", ":"],
       #["--try-revision", "lib=" ++ oldRev, "--try-revision", "lib=" ++ newRev]] do
     discard <| expectError project args ""
   let positional ← cli #["4.36.0", "--", "--json"]
@@ -89,6 +90,9 @@ private def inputErrors : IO Unit := withProject fun project => do
 def fixture (mode : String) (args : List String) : IO UInt32 := do
   if args.head? == some "run" then
     if mode == "unavailable" then return 1
+    if let ["run", _, "lake", "-d", _, "run", "inspect", output] := args then
+      writeTrialOutputDirs output
+      return 0
     if args.getLast? == some "build" then
       if mode == "timeout" then
         IO.println "build started"
@@ -168,28 +172,87 @@ private def namedTargets : IO Unit := withTempDir fun project => do
     "name = \"app\"\n[[lean_lib]]\nname = \"CoreLib\"\n[[require]]\nname = \"dep\"\npath = \"dep\"\n"
   IO.FS.writeFile (dep / "lakefile.toml") "name = \"dep\"\n[[lean_lib]]\nname = \"Extra\"\n"
   writeJson (dep / "lake-manifest.json") (projectLock #[] "dep")
+  -- Lake ignores a leftover Git subdirectory on a path entry.
   let entry := Json.mkObj [("name", "dep"), ("type", "path"), ("dir", "dep"),
-    ("configFile", "lakefile.toml"), ("inherited", false)]
+    ("configFile", "lakefile.toml"), ("subDir", "../unused"), ("inherited", false)]
   writeJson (project / "lake-manifest.json") (projectLock #[entry])
   let toolchain := (include_str "../lean-toolchain").trimAscii.copy
   IO.FS.writeFile (project / "lean-toolchain") toolchain
-  let args := #[toolchain, "--project", project.toString, "--build-target=CoreLib", "--build-target", "@dep/+Extra:olean"]
-  let files := [project / "CoreLib.lean", dep / "Extra.lean"]
+  let targets := #["CoreLib.lean:olean", "dep/Extra.lean:olean", "CoreLib/Sub.lean:olean", ":extraDep", "@dep:extraDep"]
+  let build := fun (specs : Array String) =>
+    #[toolchain, "--project", project.toString] ++ specs.map ("--build-target=" ++ ·)
+  let args := build targets
+  IO.FS.createDir (project / "CoreLib")
+  let files := [project / "CoreLib.lean", dep / "Extra.lean", project / "CoreLib/Sub.lean"]
   for file in files do IO.FS.writeFile file "example : Nat := 1\n"
   for file in files do
     IO.FS.writeFile file "example : Nat := false\n"
     let failed ← cli args
     expectCode failed 1
-    check (failed.stdout.contains "CoreLib, @dep/+Extra:olean" && failed.stdout.contains file.fileName.get!) failed.stdout
+    check (failed.stdout.contains "CoreLib.lean:olean, dep/Extra.lean:olean" && failed.stdout.contains file.fileName.get!)
+      failed.stdout
     IO.FS.writeFile file "example : Nat := 1\n"
   let passed ← jsonResult (← cli (args.push "--json")) 0
-  check (passed.getObjValD "build_targets" == toJson ["CoreLib", "@dep/+Extra:olean"] &&
+  check (passed.getObjValD "build_targets" == toJson targets &&
     (passed.getObjValD "verification").getObjValD "status" == "passed") passed.compress
   IO.FS.writeFile (dep / "lean-toolchain") "leanprover/lean4:v4.34.1\n"
-  let strict ← jsonResult (← cli (args ++ #["--strict", "--json"])) 1
+  let named := build #["CoreLib", "@dep/+Extra:olean", "./CoreLib/Sub.lean:olean"]
+  let strict ← jsonResult (← cli (named ++ #["--strict", "--json"])) 1
   check ((strict.getObjValD "verification").getObjValD "status" == "passed" &&
     (LakeCompat.Report.rows strict "findings").any (fun f => f.getObjValD "kind" == "toolchain_mismatch")) strict.compress
+  -- A filename that is only a declaration in a dependency still needs a package qualifier.
+  IO.FS.writeFile (dep / "lakefile.toml")
+    "name = \"dep\"\n[[lean_lib]]\nname = \"OnlyHere.lean\"\n"
+  IO.FS.createDir (dep / "OnlyHere")
+  IO.FS.writeFile (dep / "OnlyHere/lean.lean") "example : True := trivial\n"
+  expectCode (← cli (build #["@dep/OnlyHere.lean"])) 0
+  let absent ← cli (build #["OnlyHere.lean"])
+  expectCode absent 1
+  check (absent.stdout.contains "OnlyHere.lean" && absent.stdout.contains "package 'app'") absent.stdout
+  IO.FS.writeFile (dep / "lakefile.toml") "name = \"dep\"\nextraDepTargets = [\"MissingInput\"]\n"
+  let facet ← cli (build #["@dep:extraDep"])
+  expectCode facet 1
+  check (facet.stdout.contains "MissingInput") facet.stdout
   check (!(← (project / ".lake").pathExists)) "named-target build wrote to the source project"
+
+private def testDriver : IO Unit := withTempDir fun project => do
+  let toolchain := (include_str "../lean-toolchain").trimAscii.copy
+  let args := #[toolchain, "--project", project.toString, "--test", "--json"]
+  let lock := projectLock #[]
+  writeJson (project / "lake-manifest.json") lock
+  IO.FS.writeFile (project / "lean-toolchain") toolchain
+  let config := project / "lakefile.toml"
+  IO.FS.writeFile config "name = \"app\"\n"
+  let missing ← jsonResult (← cli args) 2
+  let result := missing.getObjValD "verification"
+  check (result.getObjValD "status" == "inconclusive" && result.getObjValD "test_exit_code" == .null &&
+    (LakeCompat.Report.string result "message").contains "test driver") missing.compress
+  IO.FS.writeFile config <| "name = \"app\"\ntestDriver = \"tests\"\ntestDriverArgs = [\"configured\"]\n" ++
+    "[[lean_exe]]\nname = \"tests\"\nroot = \"Tests\"\n"
+  IO.FS.writeFile (project / "Tests.lean") <|
+    "def main (args : List String) : IO UInt32 := do\n  let mode ← IO.FS.readFile \"mode\"\n" ++
+    "  IO.println (\"driver \" ++ mode)\n  IO.println (reprStr args)\n" ++
+    "  if mode == \"change-lock\" then IO.FS.writeFile \"lake-manifest.json\" \"{}\"\n" ++
+    "  return if mode == \"fail\" then 7 else 0\n"
+  for (mode, code, status, testCode) in [("pass", 0, "passed", 0), ("fail", 1, "failed", 7),
+                                          ("change-lock", 2, "inconclusive", 0)] do
+    IO.FS.writeFile (project / "mode") mode
+    let driverArgs := if mode == "pass" then #["--filter", "case one", "", "--help", "--strict", "--"] else #[]
+    let trialArgs := if !driverArgs.isEmpty then args.push "--" ++ driverArgs
+                     else if mode == "fail" then args ++ #["--build-target", "./Tests.lean:olean"] else args
+    let report ← jsonResult (← cli trialArgs) code.toUInt32
+    let result := report.getObjValD "verification"
+    check (report.getObjValD "test_requested" == true && result.getObjValD "status" == .str status &&
+      result.getObjValD "test_exit_code" == toJson testCode &&
+      (LakeCompat.Report.string result "output").contains ("driver " ++ mode) &&
+      (LakeCompat.Report.string result "output").contains (reprStr ("configured" :: driverArgs.toList))) report.compress
+    let recordedArgs := if driverArgs.isEmpty then Json.null else toJson driverArgs
+    check (report.getObjValD "test_args" == recordedArgs) report.compress
+  let buildFailure ← jsonResult (← cli (args ++ #["--build-target", "Missing"])) 1
+  let result := buildFailure.getObjValD "verification"
+  check (result.getObjValD "status" == "failed" && result.getObjValD "test_exit_code" == .null) result.compress
+  check ((← readJson (project / "lake-manifest.json")) == lock && !(← (project / ".lake").pathExists))
+    "test-driver trial wrote to the source project"
 
 def run : IO Unit := do
   let version := (include_str "../VERSION").trimAscii.copy
@@ -202,5 +265,6 @@ def run : IO Unit := do
   unless Platform.isWindows do
     trials
     namedTargets
+    testDriver
 
 end LeanTests.Cli

@@ -1,6 +1,6 @@
 import Lean.Data.Json.Parser
 import Lean.Data.Json.Printer
-import Lake.Util.Version
+import Lake.Load.Manifest
 import Std.Data.TreeMap
 
 namespace LakeCompat
@@ -62,7 +62,7 @@ structure LockedPackage where
   name : String
   scope : String
   inherited : Bool
-  manifestFile : Option String
+  manifestFile : String
   source : LockedSource
   deriving Inhabited
 
@@ -77,6 +77,19 @@ structure Lock where
 
 def manifestName := "lake-manifest.json"
 
+/-- An empty Lake overrides manifest leaves the root lock in effect. -/
+def packageOverridesIssue? (lakeDir : FilePath) : IO (Option String) := do
+  let file := lakeDir / "package-overrides.json"
+  try
+    unless (← file.metadata).type == .file do
+      return some s!"Cannot inspect package overrides at {file}: expected a regular file."
+    let entries ← IO.ofExcept (Lake.Manifest.parseEntries (← IO.FS.readFile file))
+    if entries.isEmpty then return none
+    return some s!"{file} contains package overrides that can replace entries from the root lock."
+  catch
+    | .noFileOrDirectory .. => return none
+    | e => return some s!"Cannot inspect package overrides at {file}: {e}"
+
 private def stringField (obj : Json) (key : String) : Except String String := do
   let some s := (obj.getObjValD key).getStr?.toOption | throw s!"expected a non-empty string for {key}"
   if s.isEmpty || s.contains (Char.ofNat 0) then throw s!"expected a non-empty string for {key}"
@@ -86,9 +99,9 @@ private def optionalString (obj : Json) (key : String) : Except String (Option S
   if obj.getObjValD key == .null then pure none else some <$> stringField obj key
 
 private def boolField (obj : Json) (key : String) (fallback : Option Bool := none) : Except String Bool :=
-  match (obj.getObjVal? key).toOption, fallback with
-  | none, some b => pure b
-  | some (.bool b), _ => pure b
+  match obj.getObjValD key, fallback with
+  | .null, some b => pure b
+  | .bool b, _ => pure b
   | _, _ => throw s!"expected a boolean for {key}"
 
 /-- Unwrap a package without discarding fields needed to write an updated trial lock. -/
@@ -104,17 +117,19 @@ private def decodePackage (raw : Json) : Except String LockedPackage := do
   let (kind, fields, legacy) ← unpackEntry raw
   let name ← packageName (← stringField fields "name")
   let inherited ← boolField fields "inherited"
-  let copy ← boolField fields "copy" (some false)
-  let scope ← match (fields.getObjVal? "scope").toOption with
-    | none => pure ""
-    | some v => v.getStr?.mapError fun _ => s!"expected a string for {name}.scope"
-  let manifestFile ← if (fields.getObjVal? "manifestFile").isOk then optionalString fields "manifestFile"
-                     else pure (some manifestName)
-  let subDir ← optionalString fields (if legacy then "subDir?" else "subDir")
-  let inputRev ← optionalString fields (if legacy then "inputRev?" else "inputRev")
+  let scope ← match fields.getObjValD "scope" with
+    | .null => pure ""
+    | v => v.getStr?.mapError fun _ => s!"expected a string for {name}.scope"
+  -- Tagged v5/v6 entries never recorded the package manifest path. Inspect the
+  -- conventional file when present. Newer entries can override it.
+  let manifestFile ← if legacy then pure manifestName
+    else pure ((← optionalString fields "manifestFile").getD manifestName)
   let source ← match kind with
-    | "git" => pure <| LockedSource.git (← stringField fields "url") (← stringField fields "rev") subDir inputRev
-    | "path" => pure <| LockedSource.path (← stringField fields "dir") copy
+    | "git" => do
+      let subDir ← optionalString fields (if legacy then "subDir?" else "subDir")
+      let inputRev ← optionalString fields (if legacy then "inputRev?" else "inputRev")
+      pure <| LockedSource.git (← stringField fields "url") (← stringField fields "rev") subDir inputRev
+    | "path" => pure <| LockedSource.path (← stringField fields "dir") (← boolField fields "copy" (some false))
     | _ => throw s!"unknown source type for {name}: {kind}"
   return { name, scope, inherited, manifestFile, source }
 
@@ -133,9 +148,9 @@ def Lock.ofJson (file : FilePath) (raw : Json) : Except String Lock := Except.ma
   let lakeDir := (← optionalString raw "lakeDir").getD ".lake"
   let packagesDir ← optionalString raw "packagesDir"
   let fixedToolchain ← boolField raw "fixedToolchain" (some false)
-  let entries ← match (raw.getObjVal? "packages").toOption with
-    | none => pure #[]
-    | some v => v.getArr?.mapError fun _ => "expected a packages array"
+  let entries ← match raw.getObjValD "packages" with
+    | .null => pure #[]
+    | v => v.getArr?.mapError fun _ => "expected a packages array"
   let mut packages : PackageMap := ∅
   for entry in entries do
     let p ← decodePackage entry

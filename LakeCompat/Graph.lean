@@ -1,4 +1,6 @@
 import Lean.Data.Json.FromToJson.Basic
+import Init.System.Uri
+import Std.Http.Data.URI.Encoding
 import LakeCompat.Concurrent
 import LakeCompat.GitTree
 import LakeCompat.Manifest
@@ -29,19 +31,13 @@ private def fileText? (file : FilePath) : IO (Option String) := do
     | .noFileOrDirectory .. => return none
     | e => throw e
 
-private def pin? (dir : FilePath) (readText : ReadText) : IO (Option String) := do
-  let some text ← readText (dir / "lean-toolchain") | return none
-  return some (← IO.ofExcept (normalizeToolchain text))
-
-private def packagePin (checkout boundary project : FilePath) (isGit : Bool) (readText : ReadText) :
-    IO (Option (String × String)) := do
-  let mut dir := checkout
+private def nearestPin (start : FilePath) (readText : ReadText) (boundary : Option FilePath := none) :
+    IO (Option (String × FilePath)) := do
+  let mut dir := start
   repeat
-    if let some pin ← pin? dir readText then
-      let source := if dir == checkout then "package" else if dir == project then "workspace"
-                    else if isGit then "repository" else "ancestor"
-      return some (pin, source)
-    if dir == boundary || (GitTree.relativeTo? boundary dir).isNone then return none
+    if let some text ← readText (dir / "lean-toolchain") then
+      return some (← IO.ofExcept (normalizeToolchain text), dir)
+    if boundary.any (fun root => dir == root || (GitTree.relativeTo? root dir).isNone) then return none
     let some parent := dir.parent | return none
     dir := parent
   return none
@@ -103,8 +99,7 @@ private def workspaceLinkTarget (p : FilePath) : IO FilePath := do
       args := #["-NoProfile", "-NonInteractive", "-Command", command],
       env := #[("LAKE_COMPAT_LINK_PATH", some p.toString)] }
     return ⟨target⟩
-  let raw ← IO.Process.run {cmd := "readlink", args := #[p.toString]}
-  return ⟨(raw.dropSuffix "\n").copy⟩
+  return ⟨← IO.Process.run {cmd := "readlink", args := #["-n", p.toString]}⟩
 
 /-- Split an absolute path at its root, preserving Windows drive letters and UNC shares. -/
 private def rootParts (p : FilePath) : FilePath × List String :=
@@ -214,19 +209,21 @@ private structure Observation extends Located where
 private def problem (p : Located) (kind message : String) : Observation :=
   { toLocated := p, issues := #[(kind, message)] }
 
-private def readPackage (p : Located) (project : FilePath) (repo : Option FilePath)
+private def readPackage (p : Located) (workspaceRoot : FilePath) (repo : Option FilePath)
     (readText : ReadText) (issues : Array Issue := #[]) : IO Observation := do
   let mut issues := issues
   let mut pin := none
   try
-    pin ← packagePin p.path (repo.getD project) project repo.isSome readText
-    if pin.isNone then
+    if let some (toolchain, dir) ← nearestPin p.path readText (some (repo.getD workspaceRoot)) then
+      let source := if dir == p.path then "package" else if repo.isSome then "repository"
+                    else if dir == workspaceRoot then "workspace" else "ancestor"
+      pin := some (toolchain, source)
+    else
       issues := issues.push ("unknown_toolchain", "No lean-toolchain file was found for this package.")
   catch e =>
     issues := issues.push ("unknown_toolchain", s!"Cannot read the package toolchain: {e}")
   let obs : Observation := { toLocated := p, pin, issues }
-  let some manifest := p.entry.manifestFile | return { obs with issues := issues.push (
-    "missing_manifest", "The root lock records no package manifest to inspect for dependency pins.") }
+  let manifest := p.entry.manifestFile
   let file := p.path / manifest
   try
     let some contents ← readText file | return { obs with issues := issues.push (
@@ -246,8 +243,8 @@ private structure Directory extends SourcePath where
 private abbrev Inspect (α β : Type) := DirectoryQuery α → Except Issue Directory → IO β
 private abbrev BatchResult (α β : Type) := Sum (DirectoryQuery α) β
 
-/-- Packages in one committed tree often inherit a toolchain from a common ancestor.
-Cache both present and absent pins for the batch without retaining package manifests. -/
+/-- Siblings often inherit a toolchain from a common ancestor. Cache present and absent
+pin files for one working tree or commit without retaining package manifests. -/
 private def cacheToolchains (readText : ReadText) : IO ReadText := do
   let pins ← IO.mkRef (∅ : Std.HashMap FilePath (Option String))
   return fun path => do
@@ -355,7 +352,7 @@ private def repositories (packagesDir : FilePath) (lock : Lock) : IO Repositorie
     m.alter path.toString.toLower fun paths => some (path :: paths.getD [])
   return {exact, folded}
 
-private def observe (project packages : FilePath) (lock : Lock) (repos : Repositories)
+private def observe (project packages workspaceRoot : FilePath) (lock : Lock) (repos : Repositories)
     (env : GitTree.Env) : IO (Observations × SourcePaths) := do
   let mut queries := #[]
   for (name, entry) in lock.packages do
@@ -365,13 +362,15 @@ private def observe (project packages : FilePath) (lock : Lock) (repos : Reposit
       queries := queries.push {key := entry, path := subDir.elim repo (repo / ·), gitRepo := some repo}
     | .path dir copy =>
       queries := queries.push {key := entry, path := if copy then packages / name else project / dir}
+  let workspaceText ← cacheToolchains fileText?
   let observations ← inspectDirectories repos env queries fun q result => do
     let obs ← match result with
       | .error (kind, message) => pure (problem ⟨q.toSourcePath, q.key⟩ kind message)
       | .ok dir => do
         let p := ⟨dir.toSourcePath, q.key⟩
         let available ← if dir.origin.isSome then pure true else dir.path.isDir
-        if available then readPackage p project dir.repo dir.readText dir.issues else pure (missing p)
+        let readText := if dir.repo.isNone then workspaceText else dir.readText
+        if available then readPackage p workspaceRoot dir.repo readText dir.issues else pure (missing p)
     return ({obs with issues := q.issues ++ obs.issues}, result.map (·.toSourcePath))
   let mut packages := ∅
   let mut sources := ∅
@@ -402,44 +401,105 @@ private def shortestPaths (root : String) (observations : Observations) : Std.Ha
     i := i + 1
   return paths
 
-private def sameRemote (a b : String) : Bool :=
-  a == b || match Source.githubRepo? a, Source.githubRepo? b with
-    | some (ao, ar), some (bo, br) => ao.toLower == bo.toLower && ar.toLower == br.toLower
-    | _, _ => false
+/-- Git's local file transport accepts an absolute percent-encoded path. Compare only
+local authorities and leave Git's home-relative URL syntax to the transport. -/
+private def localRemotePath? (url : String) : Option FilePath := do
+  let some rest := url.dropPrefix? "file://" | return ← Source.localGitPath? url
+  let slash ← rest.find? '/'
+  let host := rest.sliceTo slash
+  guard (host.isEmpty || host.copy.toLower == "localhost")
+  let path := (rest.sliceFrom slash).copy
+  -- Normalize literal Unicode to escaped bytes while keeping existing ASCII escapes.
+  -- Validate before fileUriToPath?, which expects percent-decoded UTF-8.
+  let encoded := Std.Http.URI.EncodedString.encode (r := fun _ => true) path
+  guard (Std.Http.URI.isValidPercentEncoding encoded.toByteArray)
+  let decoded ← encoded.decode
+  guard (!decoded.contains (Char.ofNat 0) && !decoded.startsWith "/~")
+  if Platform.isWindows then Uri.fileUriToPath? url else return ⟨decoded⟩
 
-private def sourcePaths (project : FilePath) (repos : Repositories) (env : GitTree.Env)
-    (observations : Observations) (known : SourcePaths) : IO SourcePaths := do
-  let mut requested : Std.HashSet SourcePath := ∅
+private def sameRemote (project : FilePath) (a b : String) : IO Bool := do
+  if a == b then return true
+  if let some (ao, ar) := Source.githubRepo? a then
+    let some (bo, br) := Source.githubRepo? b | return false
+    return ao.toLower == bo.toLower && ar.toLower == br.toLower
+  let some left := localRemotePath? a | return false
+  let some right := localRemotePath? b | return false
+  -- Lake materializes inherited Git URLs from the workspace, even for nested packages.
+  let resolve := fun (path : FilePath) => do
+    let path := project / path
+    unless ← path.pathExists do return none
+    return (← (IO.FS.realPath path).toBaseIO).toOption
+  let some left ← resolve left | return false
+  return (← resolve right) == some left
+
+private def differentSubdirs (a b : Option String) : Bool :=
+  a != b && Source.directoryKey (a.getD "") != Source.directoryKey (b.getD "")
+
+private inductive SourceQuery where
+  | path (source : SourcePath)
+  | gitSubdir (package dir : String)
+  deriving BEq, Hashable
+
+private structure EdgeSources where
+  paths : SourcePaths
+  equivalentSubdirs : Std.HashSet (String × String) := ∅
+
+private def sourcePaths (project packages : FilePath) (repos : Repositories) (env : GitTree.Env)
+    (observations : Observations) (known : SourcePaths) : IO EdgeSources := do
+  let mut requested : Std.HashSet SourceQuery := ∅
   for (_, parent) in observations do
     for (child, wanted) in parent.edges do
       let some selected := observations[child]? | continue
-      if let .path dir _ := wanted.source then
-        if let .path rootDir _ := selected.entry.source then
-          let left := parent.toSourcePath.join dir
-          let right := {path := project / rootDir : SourcePath}
-          if left != right then
-            unless known.contains left do requested := requested.insert left
-            unless known.contains right do requested := requested.insert right
-  let resolved ← inspectDirectories repos env (requested.toArray.map fun source => {key := source, toSourcePath := source})
+      match wanted.source, selected.entry.source with
+      | .path dir _, .path rootDir _ =>
+        let left := parent.toSourcePath.join dir
+        let right := {path := project / rootDir : SourcePath}
+        if left != right then
+          unless known.contains left do requested := requested.insert (.path left)
+          unless known.contains right do requested := requested.insert (.path right)
+      | .git url rev sub _, .git rootUrl rootRev rootSub _ =>
+        let dir := sub.getD ""
+        let rootDir := rootSub.getD ""
+        if selected.origin.isSome && differentSubdirs sub rootSub &&
+            !(FilePath.mk dir).isAbsolute && !(FilePath.mk rootDir).isAbsolute &&
+            rev.toLower == rootRev.toLower then
+          if ← sameRemote project url rootUrl then requested := requested.insert (.gitSubdir child dir)
+      | _, _ => pure ()
+  let queries : Array (DirectoryQuery SourceQuery) := requested.toArray.map fun key =>
+    match key with
+    | .path path => {key, toSourcePath := path}
+    | .gitSubdir child dir =>
+      let repo := packages / child
+      {key, path := repo / dir, gitRepo := some repo}
+  let resolved ← inspectDirectories repos env queries
     fun q result => pure (q.key, result.map (·.toSourcePath))
-  return resolved.foldl (init := known) fun m (key, path) => m.insert key path
+  let mut sources : EdgeSources := {paths := known}
+  for (key, result) in resolved do
+    match key with
+    | .path path => sources := {sources with paths := sources.paths.insert path result}
+    | .gitSubdir child dir =>
+      if let .ok path := result then
+        if path == observations[child]!.toSourcePath then
+          sources := {sources with equivalentSubdirs := sources.equivalentSubdirs.insert (child, dir)}
+  return sources
 
 private def conflict (parent : Observation) (wanted selected : LockedPackage) (project : FilePath)
-    (sources : SourcePaths) : Option Issue := Id.run do
+    (sources : EdgeSources) : IO (Option Issue) := do
   let name := parent.entry.name
   match wanted.source, selected.source with
   | .git url rev sub _, .git rootUrl rootRev rootSub _ =>
     if rev.toLower != rootRev.toLower then
       return some ("revision_conflict", s!"{name} locks {rev}. The root selects {rootRev}.")
-    if !sameRemote url rootUrl then
+    unless ← sameRemote project url rootUrl do
       return some ("source_conflict", s!"{name} locks repository {url}. The root locks {rootUrl}.")
-    if Source.directoryKey (sub.getD "") != Source.directoryKey (rootSub.getD "") then
+    if differentSubdirs sub rootSub &&
+        !sources.equivalentSubdirs.contains (selected.name, sub.getD "") then
       return some ("source_conflict", s!"{name} and the root select different package subdirectories at the same revision.")
   | .path dir _, .path rootDir _ =>
     let requested := parent.toSourcePath.join dir
     let actual := {path := project / rootDir : SourcePath}
     if requested == actual then return none
-    match sources[requested]!, sources[actual]! with
+    match sources.paths[requested]!, sources.paths[actual]! with
     | .ok requested, .ok actual =>
       if requested != actual then
         let describe := fun (s : SourcePath) =>
@@ -481,18 +541,18 @@ def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Jso
   let root := if root == "[anonymous]" then dirname else root
   let lakeDir := project / lock.lakeDir
   let packagesDir ← resolvePath (lock.packagesDir.elim (lakeDir / "packages") (project / ·))
-  let rootPin ← pin? project fileText?
+  -- A nested Lake project can share its enclosing workspace's elan toolchain.
+  let rootPin ← nearestPin project fileText?
+  let workspaceRoot := (rootPin.map Prod.snd).getD project
   let repos ← repositories packagesDir lock
   let env ← if repos.exact.isEmpty then pure #[] else GitTree.environment
-  let (observations, known) ← observe project packagesDir lock repos env
+  let (observations, known) ← observe project packagesDir workspaceRoot lock repos env
   let paths := shortestPaths root observations
-  let sources ← sourcePaths project repos env observations known
+  let sources ← sourcePaths project packagesDir repos env observations known
   let mut packages := #[]
   let mut findings := #[]
-  let overrides := lakeDir / "package-overrides.json"
-  if (← overrides.metadata.toBaseIO).toOption.any (·.type == .file) then
-    findings := findings.push (finding root [root] ("active_overrides",
-      s!"{overrides} can replace packages from the root lock at build time."))
+  if let some message ← packageOverridesIssue? lakeDir then
+    findings := findings.push (finding root [root] ("active_overrides", message))
   for (name, obs) in observations do
     let path := (paths.getD name []).reverse
     packages := packages.push (inventory obs path)
@@ -507,15 +567,15 @@ def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Jso
     for issue in issues do findings := findings.push (finding name path issue)
     for (child, wanted) in obs.edges do
       let selected := lock.packages[child]?
-      let issue := match selected with
+      let issue ← match selected with
         | some selected => conflict obs wanted selected project sources
-        | none => some ("unlocked_dependency", s!"{name} locks {child}, which is absent from the root manifest.")
+        | none => pure <| some ("unlocked_dependency", s!"{name} locks {child}, which is absent from the root manifest.")
       if let some issue := issue then
         let detail := Json.mkObj [("parent", name), ("requested_revision", toJson wanted.source.revision?),
                                   ("selected_revision", toJson (selected.bind (·.source.revision?)))]
         let chain := if path.isEmpty then [] else path ++ [child]
         findings := findings.push ((finding child chain issue).mergeObj detail)
-  let report := Json.mkObj [("project", root), ("target", target), ("root_toolchain", toJson rootPin),
+  let report := Json.mkObj [("project", root), ("target", target), ("root_toolchain", toJson (rootPin.map Prod.fst)),
                             ("packages", .arr packages), ("findings", .arr findings)]
   return (report, raw)
 

@@ -18,19 +18,29 @@ private structure Excerpt where
   tail : ByteArray := .empty
   diagnostic : ByteArray := .empty
 
+/-- A byte cutoff can fall inside a valid UTF-8 character. Keep its leading byte
+at the cut so decoding still distinguishes valid characters from malformed output. -/
+private def charStart (bytes : ByteArray) (cut : Nat) : Nat := Id.run do
+  unless bytes[cut]?.any (·.isUTF8ContinuationByte) do return cut
+  for i in [cut - 3:cut] do
+    if let some c := bytes.utf8DecodeChar? i then
+      if cut < i + c.utf8Size then return i
+  return cut
+
 /-- Find the first compiler diagnostic about to scroll out of the tail. -/
 private def scrollingDiagnostic (bytes : ByteArray) (overflow : Nat) : ByteArray := Id.run do
   let mut start := 0
-  let mut afterColon := false
+  let mut markerStart := true
   for i in [:min bytes.size (overflow + 512)] do
     let c := Char.ofUInt8 bytes[i]!
-    if i == start || (afterColon && i > 0 && Char.ofUInt8 bytes[i - 1]! != ':') then
+    if markerStart then
       if c.toLower == 'e' || c.toLower == 'f' then
         let word := (String.fromUTF8Lossy (bytes.extract i (i + 12))).toLower
         if word.startsWith "error:" || word.startsWith "fatal:" || word.startsWith "fatal error:" then
           let offset := max start (i - 512)
-          if offset < overflow then return bytes.extract offset (offset + logLimit / 4)
-    afterColon := c == ':' || (afterColon && (c == ' ' || c == '\t'))
+          if offset < overflow then
+            return bytes.extract (charStart bytes offset) (charStart bytes (offset + logLimit / 4))
+    markerStart := c == '\n' || c == ':' || (markerStart && (c == ' ' || c == '\t'))
     if c == '\n' then start := i + 1
   return .empty
 
@@ -39,7 +49,7 @@ private def Excerpt.append (log : Excerpt) (block : ByteArray) : Excerpt := Id.r
   let overflow := bytes.size - logLimit
   if overflow == 0 then return { log with tail := bytes }
   let diagnostic := if log.diagnostic.isEmpty then scrollingDiagnostic bytes overflow else log.diagnostic
-  return { tail := bytes.extract overflow bytes.size, diagnostic }
+  return { tail := bytes.extract (charStart bytes overflow) bytes.size, diagnostic }
 
 /-- Keep complete characters within the report's UTF-8 byte budget. Decoding an invalid
 byte into the replacement character can increase the number of bytes in a build log. -/
@@ -50,10 +60,15 @@ def boundedLogTail (message : String) (limit := logLimit) : String := Id.run do
 
 private def Excerpt.text (log : Excerpt) : String := Id.run do
   let tail := String.fromUTF8Lossy log.tail
-  let excerpt := if log.diagnostic.isEmpty then boundedLogTail tail else
-    let diagnostic := String.fromUTF8Lossy log.diagnostic
-    let omitted := "\n[... output omitted ...]\n"
-    diagnostic ++ omitted ++ boundedLogTail tail (logLimit - diagnostic.utf8ByteSize - omitted.utf8ByteSize)
+  -- Replacement characters can push a diagnostic out of the rendered output
+  -- even when all of the original bytes fitted in the raw tail.
+  let diagnostic := if log.diagnostic.isEmpty && tail.utf8ByteSize > logLimit then
+      scrollingDiagnostic tail.toUTF8 (tail.utf8ByteSize - logLimit)
+    else log.diagnostic
+  if diagnostic.isEmpty then return (boundedLogTail tail).trimAscii.copy
+  let diagnostic := String.fromUTF8Lossy diagnostic
+  let omitted := "\n[... output omitted ...]\n"
+  let excerpt := diagnostic ++ omitted ++ boundedLogTail tail (logLimit - diagnostic.utf8ByteSize - omitted.utf8ByteSize)
   return excerpt.trimAscii.copy
 
 private def readOutput (pipe : IO.FS.Handle) (log : Std.Mutex Excerpt) : IO Unit := do

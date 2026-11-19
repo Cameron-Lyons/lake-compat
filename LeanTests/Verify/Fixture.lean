@@ -87,14 +87,33 @@ private def fakeBuild (scenario : String) (project : FilePath) : IO UInt32 := do
     IO.FS.writeFile "Main.lean" "-- changed during build"
     IO.println "done"
   | "change-lock" => IO.FS.writeFile "lake-manifest.json" "{}"
+  | "reformat-lock" => IO.FS.writeFile "lake-manifest.json" (← readJson "lake-manifest.json").compress
+  | "invalid-lock" => IO.FS.writeFile "lake-manifest.json" "{"
+  | "missing-toolchain" => IO.FS.removeFile "lean-toolchain"
   | "overrides" => write ".lake/package-overrides.json" "{}"
+  | "empty-overrides" => write ".lake/package-overrides.json" (manifest).compress
   | "tail" =>
     IO.println (String.ofList (List.replicate 24000 'a') ++ " ERROR at Main.lean:3")
     return 2
   | "binary-log" =>
     let out ← IO.getStdout
-    out.write ⟨Array.replicate 18000 0xff⟩
+    out.putStr "error: binary compiler output\n"
+    -- The raw stream fits in the log budget, its UTF-8 representation does not.
+    out.write ⟨Array.replicate 7000 0xff⟩
     out.putStr " build failed"
+    return 1
+  | "unicode-tail" =>
+    IO.print (String.ofList (List.replicate 5000 '😇') ++ "X")
+    return 1
+  | "compact-diagnostic" =>
+    let out ← IO.getStdout
+    let location := "Main.lean:3:8:er"
+    -- Put the middle of the severity label on an 8192-byte pipe-read boundary.
+    out.putStr (String.ofList (List.replicate (8191 - location.utf8ByteSize) 'x') ++ "\n" ++ location)
+    out.flush
+    out.putStr "ror: invalid type\n  expected Nat\n"
+    out.putStr (String.join (List.replicate 3000 "Built another target\n"))
+    out.putStr "build failed"
     return 1
   | "diagnostic" =>
     IO.print (String.join (List.replicate 2000 "Resolved dependency\n"))
@@ -121,7 +140,7 @@ private def fakeBuild (scenario : String) (project : FilePath) : IO UInt32 := do
   | "timeout" =>
     -- A descendant ignores TERM and retains the output pipe after the fake build exits.
     discard <| IO.Process.spawn {cmd := "/bin/sh", args := #["-c", "trap '' TERM; echo 'compiler still running'; exec sleep 90"]}
-  | "clone" | "check-revision" | "dirty" =>
+  | "clone" | "check-revision" | "dirty" | "staged" =>
     let fields := (LakeCompat.Report.rows (← readJson "lake-manifest.json") "packages")[0]!
     let repo := root / "dep"
     if scenario == "check-revision" then
@@ -129,6 +148,13 @@ private def fakeBuild (scenario : String) (project : FilePath) : IO UInt32 := do
     let checkout := ".lake/packages/dep-postgres"
     discard <| IO.Process.run {cmd := "git", args := #["clone", "-q", repo.toString, checkout]}
     if scenario == "dirty" then write (FilePath.mk checkout / "postgres/lakefile.lean") "-- changed"
+    if scenario == "staged" then
+      let file := "postgres/lakefile.lean"
+      let path := FilePath.mk checkout / file
+      let original ← IO.FS.readFile path
+      write path "-- staged only"
+      discard <| git checkout #["add", file]
+      write path original
   | "tagged" =>
     let entry := (LakeCompat.Report.rows (← readJson "lake-manifest.json") "packages")[0]!.getObjValD "git"
     let revision ← git (root / "sha256-dep") #["rev-parse", "HEAD"]
@@ -153,6 +179,7 @@ def fakeElan (args : List String) : IO UInt32 := do
       return 1
     IO.println "Lake version for test toolchain"
   | "translate-config", ["toml", output] => IO.FS.writeFile output "name = \"app\"\n"
+  | "-d", [_, "run", "inspect", output] => writeTrialOutputDirs output
   | "build", [] => return ← fakeBuild scenario project
   | "check-build", [] =>
     if scenario == "check-empty" then return 1

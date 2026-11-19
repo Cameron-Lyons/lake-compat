@@ -8,6 +8,12 @@ def isFullRevision (s : String) : Bool :=
 def directoryKey (value : String) : Bool × List String :=
   (value.startsWith "/", (value.splitOn "/").filter (fun p => !p.isEmpty && p != "."))
 
+/-- Git interprets a colon before the first slash as a URL, remote helper, or SCP-style
+address. Absolute filesystem paths include drive-qualified paths on Windows. -/
+def localGitPath? (url : String) : Option System.FilePath :=
+  let path : System.FilePath := url
+  if path.isAbsolute || !(url.takeWhile (· != '/')).contains ':' then some path else none
+
 /-- Repository identity for the standard GitHub HTTPS, SSH, and SCP-style remotes. -/
 def githubRepo? (url : String) : Option (String × String) := do
   let lower := url.toLower

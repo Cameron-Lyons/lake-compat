@@ -78,6 +78,19 @@ private def testTruncation : IO Unit := do
     "limit five by update requirement and deterministic full-SHA tie breaker"
   check (report.getObjValD "message" == "Showing 5 of 7 candidate revisions.") "count every eligible commit"
 
+private def testToolchainIdentity : IO Unit := do
+  let versions := #[version (rev 'a') none "4.35.0", version (rev 'b') none "v4.35.0",
+    version (rev 'c') none "other/lean4:v4.35.0", version (rev 'd') none "4.35.0-rc1"]
+  let builds := #[build (rev 'a') [] false "leanprover/lean4:4.35.0",
+    build (rev 'e') [] true "4.35.0"]
+  let report ← suggestVersions url "v4.35.0" (some "mathlib")
+    (fetch := fixture endpoint metadata versions builds)
+  let candidates := rows report
+  check (candidates.map (·.getObjValD "revision") == #[rev 'e', rev 'b'].map Json.str)
+    "equivalent toolchain spellings must match declarations and both successful and failed builds"
+  check (candidates.all (fun row => row.getObjValD "toolchain" == target))
+    "toolchain identity in candidates must use the canonical target"
+
 private def testTiedEvidence : IO Unit := do
   let versions := #[version (rev 'a') (some "alpha"), version (rev 'a') (some "beta"),
                     version (rev 'b') none]
@@ -115,6 +128,13 @@ private def testIdentity : IO Unit := do
     let report ← suggestVersions url target (some "mathlib") (fetch := metaOnly packageInfo)
     check (status report == "unsupported" && (← calls.get) == #[endpoint])
       "mismatched package, repository or directory must stop before fetching revisions"
+
+  let checker := "leanprover/lean4checker"
+  let checkerEndpoint := "https://reservoir.lean-lang.org/api/v1/packages/leanprover/Lean4Checker"
+  let checkerFetch := fixture checkerEndpoint (metadata "lean4checker" checker) #[] #[build (rev 'a')]
+  let report ← suggestVersions ("https://github.com/" ++ checker) target (some "Lean4Checker") (fetch := checkerFetch)
+  check (status report == "found" && (rows report).map (·.getObjValD "revision") == #[Json.str (rev 'a')])
+    "Lake lock names can differ in case from the same Reservoir package"
 
   let base := "https://reservoir.lean-lang.org/api/v1/packages/my%20scope/my%2Bpkg"
   let fetch := fixture base (metadata "my+pkg" repo.toUpper (some "src/library")) #[] #[]
@@ -183,6 +203,7 @@ private def testPartialHistory : IO Unit := do
 def run : IO Unit := do
   testRanking
   testTruncation
+  testToolchainIdentity
   testTiedEvidence
   testIdentity
   testFailures

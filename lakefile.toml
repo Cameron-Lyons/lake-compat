@@ -15,6 +15,11 @@ name = "releaseVersion"
 path = "VERSION"
 text = true
 
+[[input_file]]
+name = "workspaceInspector"
+path = "scripts/inspect-workspace.lean"
+text = true
+
 [[input_dir]]
 name = "demoSources"
 path = "examples/upgrade-demo"
@@ -23,7 +28,7 @@ filter = { fileName = ["Main.lean", "Greeting.lean", "lakefile.toml", "lake-mani
 
 [[lean_lib]]
 name = "LakeCompat"
-needs = ["demoSources", "releaseVersion"]
+needs = ["demoSources", "releaseVersion", "workspaceInspector"]
 
 [[lean_lib]]
 name = "LeanTests"

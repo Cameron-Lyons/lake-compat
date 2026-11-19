@@ -1,6 +1,7 @@
 import Lake.Util.Reservoir
 import Std.Data.HashMap
 import Std.Http.Data.URI.Encoding
+import LakeCompat.Manifest
 import LakeCompat.Source
 
 open Lean
@@ -77,6 +78,10 @@ private def encode (s : String) : String :=
 private def stringField (row : Json) (name : String) : String :=
   ((row.getObjValD name).getStr?).toOption.getD ""
 
+private def matchesTarget (row : Json) (target : String) : Bool :=
+  let declared := stringField row "toolchain"
+  declared == target || (normalizeToolchain declared).toOption == some target
+
 private def matchesSource (sources : Array Json) (repo subDir : String) : Bool :=
   let repo := repo.toLower
   let dir := Source.directoryKey subDir
@@ -137,7 +142,7 @@ private def indexVersions (versions : Array Json) (target : String) : Except Reg
     let tag := if printable label && compare evidence.tag (some (date, label)) == .lt
       then some (date, label) else evidence.tag
     index := index.insert rev { evidence with
-      declared := evidence.declared || stringField row "toolchain" == target
+      declared := evidence.declared || matchesTarget row target
       date := max evidence.date date
       tag }
   return index
@@ -151,7 +156,7 @@ private def Build.priority (b : Build) :=
 private def indexBuilds (initial : Index) (builds : Array Json) (target : String) : Except RegistryError Index := do
   let mut index := initial
   for row in builds do
-    if stringField row "toolchain" != target then continue
+    unless matchesTarget row target do continue
     let some rev := revision? row | continue
     let .bool built := row.getObjValD "built" | throw .invalid
     let tested : Option Bool ← optionalField row "tested"
@@ -204,7 +209,8 @@ private def lookup (fetch : Fetch) (endpoint target repo : String) (package subD
   if let some expected := package then
     let .str name := metadata.getObjValD "name" | throw .invalid
     if name.isEmpty then throw .invalid
-    if name != expected then
+    -- Reservoir indexes package identifiers case-insensitively.
+    if name.toLower != expected.toLower then
       return result "unsupported" "Registry package name differs from the requested name."
   let .arr sources := metadata.getObjValD "sources" | throw .invalid
   unless matchesSource sources repo (subDir.getD ".") do
@@ -241,6 +247,7 @@ def supportsLookup (url : String) (package scope : Option String) : Bool :=
 /-- Look up one Git package and rank revisions with evidence for the exact target toolchain. -/
 def suggestVersions (url target : String) (package scope subDir : Option String := none)
     (fetch : Fetch := fetchJson) : IO Json := do
+  let .ok target := normalizeToolchain target | return result "unsupported" "Invalid target toolchain."
   let (endpoint, repo) ← match registrySource url package scope with
     | .ok source => pure source
     | .error message => return result "unsupported" message

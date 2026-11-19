@@ -35,18 +35,20 @@ structure Reader where
   input : IO.FS.Handle
   output : IO.FS.Handle
   private trees : IO.Ref (Std.HashMap String Tree)
+  private commands : Bool
+  private head : Option String := none
 
-/-- Share one cat-file process and the parsed directory trees across a checkout. -/
-def withReader (repo : FilePath) (env : Env) (use : Reader → IO α) : IO α := do
+private def withCatFile (repo : FilePath) (env : Env) (commands : Bool)
+    (use : Reader → IO α) : IO (α × UInt32) := do
   let trees ← IO.mkRef ∅
   let child ← IO.Process.spawn {
-    cmd := "git", args := #["--git-dir=.git", "cat-file", "--batch", "--follow-symlinks"],
+    cmd := "git", args := #["--git-dir=.git", "cat-file", if commands then "--batch-command" else "--batch",
+                            "--follow-symlinks"],
     cwd := repo, env, stdin := .piped, stdout := .piped, stderr := .null }
   let (input, child) ← child.takeStdin
   try
-    let value ← use ⟨repo, env, input, child.stdout, trees⟩
-    discard child.wait
-    return value
+    let value ← use {repo, env, input, output := child.stdout, trees, commands}
+    return (value, ← child.wait)
   catch e =>
     try child.kill catch _ => pure ()
     discard child.wait
@@ -71,16 +73,18 @@ private inductive Record where
   | missing
   | unresolved
 
-private def Reader.lookup (git : Reader) (spec : String) : IO Record := do
+private def Reader.lookup (git : Reader) (spec : String) (infoOnly := false) : IO Record := do
   if spec.contains '\n' then throw <| IO.userError "invalid newline in Git object query"
-  git.input.putStr (spec ++ "\n")
+  let command := if git.commands then (if infoOnly then "info " else "contents ") else ""
+  git.input.putStr (command ++ spec ++ "\n")
   git.input.flush
   let header := ((← git.output.getLine).dropSuffix "\n").copy
   if header == spec ++ " missing" then return .missing
   match header.splitOn " " with
   | [hash, type, size] =>
     let some n := size.toNat? | throw <| IO.userError "invalid Git object length"
-    return .found ⟨hash, type, ← readBytes git.output n⟩
+    let data ← if infoOnly && git.commands then pure .empty else readBytes git.output n
+    return .found ⟨hash, type, data⟩
   | [kind, size] =>
     if ["symlink", "dangling", "loop", "notdir"].contains kind then
       if let some n := size.toNat? then
@@ -89,14 +93,30 @@ private def Reader.lookup (git : Reader) (spec : String) : IO Record := do
     throw <| IO.userError s!"Git could not read {spec}"
   | _ => throw <| IO.userError s!"Git could not read {spec}"
 
-def Reader.head? (git : Reader) : IO (Option String) := do
-  let .found obj ← git.lookup "HEAD" | return none
+private def Reader.readHead (git : Reader) : IO (Option String) := do
+  let .found obj ← git.lookup "HEAD" true | return none
   return if obj.type == "commit" then some obj.hash else none
+
+/-- Share one cat-file process and the parsed directory trees across a checkout. The HEAD
+query also checks whether Git accepts batch commands before handing the reader to its caller. -/
+def withReader (repo : FilePath) (env : Env) (use : Reader → IO α) : IO α := do
+  let (result, code) ← withCatFile repo env true fun git => do
+    match ← git.readHead.toBaseIO with
+    | .ok head => return Except.ok (← use {git with head})
+    | .error e => return Except.error e
+  match result with
+  | .ok value => return value
+  | .error e =>
+    unless code == 129 do throw e -- Older Git versions reject --batch-command as an unknown option.
+    return (← withCatFile repo env false fun git => do use {git with head := ← git.readHead}).1
+
+def Reader.head? (git : Reader) : IO (Option String) := pure git.head
 
 /-- Check for a complete, locally available commit ID without accepting symbolic refs or tags. -/
 def Reader.hasCommit (git : Reader) (revision : String) : IO Bool := do
   unless Source.isFullRevision revision do return false
-  let .found obj ← git.lookup (revision ++ "^{commit}") | return false
+  let spec := if git.commands then revision else revision ++ "^{commit}"
+  let .found obj ← git.lookup spec true | return false
   return obj.type == "commit" && obj.hash == revision.toLower
 
 private def Object.text (obj : Object) (name : String) : IO String := do

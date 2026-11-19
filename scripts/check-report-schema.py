@@ -23,7 +23,7 @@ def main():
     validator = Draft202012Validator(schema)
 
     def check(args, code=0, status=None, env=None):
-        command = [str(cli), *args, "--json"]
+        command = [str(cli), "--json", *args]
         proc = subprocess.run(command, capture_output=True, text=True, env=env, timeout=90)
         if proc.returncode != code:
             raise RuntimeError(
@@ -52,6 +52,19 @@ def main():
         work = Path(temp)
         project = work / "project"
         project.mkdir()
+        (project / "lakefile.toml").write_text(
+            'name = "app"\ntestDriver = "Checks"\n[[lean_lib]]\nname = "Checks"\n'
+        )
+        (project / "Checks.lean").write_text("example : 1 + 1 = 2 := rfl\n")
+        (project / "lake-manifest.json").write_text(json.dumps({"name": "app", "version": "1.2.0"}))
+        tested = check([target, "--project", str(project), "--test"], status="passed")
+        if tested.get("test_requested") is not True or tested["verification"].get("test_exit_code") != 0:
+            raise ValueError("The trial must report the successful Lake test driver")
+        # Lake library test drivers reject arguments. The report still records the invocation.
+        driver_args = ["--filter", "case one"]
+        failed = check([target, "--project", str(project), "--test", "--", *driver_args], 1, "failed")
+        if failed.get("test_args") != driver_args or not failed["verification"].get("test_exit_code"):
+            raise ValueError("The trial must report the arguments and failing Lake test exit code")
         (project / "lakefile.toml").write_text('name = "app"\n')
         dependency = {
             "name": "lib",
@@ -86,7 +99,9 @@ def main():
             raise ValueError("The automatic trial must report its selected revision")
 
         (project / ".lake").mkdir()
-        (project / ".lake/package-overrides.json").write_text('{"packages": []}\n')
+        (project / ".lake/package-overrides.json").write_text(
+            json.dumps({"schemaVersion": "1.3.0", "packages": [dependency]})
+        )
         check([*args, "--verify"], 2, "inconclusive")
 
     print("CLI reports validated against schema/report-v1.json.")

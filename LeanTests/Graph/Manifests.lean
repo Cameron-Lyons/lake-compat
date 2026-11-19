@@ -71,9 +71,16 @@ private def gitSubdirectories (project : FilePath) : IO Unit := do
   pin repo
   manifest repo
   manifest (repo / "lib")
+  manifest (repo / "nested")
+  manifest (repo / "nested/app")
+  link (repo / "alias") "nested/app"
   let rev ← commitMetadata repo
+  IO.FS.removeFile (repo / "alias")
+  link (repo / "alias") "lib"
   let cases : List (Json × String × Array String) := [
-    (.null, ".", #[]), ("lib/", "./lib//.", #[]), ("lib", ".", #["source_conflict"])]
+    (.null, ".", #[]), ("lib/", "./lib//.", #[]), ("lib", ".", #["source_conflict"]),
+    ("nested/app", "alias", #[]), ("nested", "alias/..", #[]), (.null, "lib/..", #[]),
+    ("lib", "alias", #["source_conflict"]), (.null, "absent/..", #["source_conflict"])]
   for (selected, requested, expected) in cases do
     manifest (project / "parent") #[gitDep "child" rev (fields := [("subDir", requested)])]
     manifest project #[localDep "parent" "parent", gitDep "child" rev true [("subDir", selected)]]
@@ -85,6 +92,35 @@ private def externalPin (project : FilePath) : IO Unit := do
   pin parent
   manifest (parent / "external")
   expectKinds (← report project) #["unknown_toolchain"]
+
+private def enclosingToolchain (workspace : FilePath) : IO Unit := do
+  let project := workspace / "apps/nested"
+  let localPkg := localDep "local" "src/local"
+  let shared := localDep "shared" "../../libs/shared"
+  manifest (project / "src/local")
+  manifest (workspace / "libs/shared")
+  manifest project #[localPkg, shared]
+  let inherited ← report project
+  expectField inherited "root_toolchain" older
+  expectKinds inherited #[]
+  for name in ["local", "shared"] do
+    let entry ← pkg inherited name
+    expectField entry "toolchain" older
+    expectField entry "toolchain_source" "workspace"
+  pin (workspace / "libs") target
+  let checkout := packagesDir project / "locked"
+  manifest checkout
+  manifest project #[localPkg, shared, gitDep "locked" (← commitMetadata checkout)]
+  let overridden ← report project
+  expectField (← pkg overridden "shared") "toolchain_source" "ancestor"
+  expectField (← pkg overridden "shared") "toolchain" target
+  let missing ← onlyFinding overridden
+  expectField missing "package" "locked"
+  expectField missing "kind" "unknown_toolchain"
+  pin project target
+  let nearer ← report project
+  expectField nearer "root_toolchain" target
+  expectField (← pkg nearer "local") "toolchain" target
 
 private def missingAncestry (project : FilePath) : IO Unit := do
   let orphan := packagesDir project / "orphan"
@@ -100,6 +136,18 @@ private def missingLocks (project : FilePath) : IO Unit := do
   manifest project #[localDep "a" "a", localDep "b" "b" (fields := [("manifestFile", .null)])]
   for name in ["a", "b"] do pin (project / name)
   expectKinds (← report project) #["missing_manifest", "missing_manifest"]
+
+private def nullDefaults (project : FilePath) : IO Unit := do
+  manifest project #[localDep "parent" "parent" (fields := [
+    ("manifestFile", .null), ("copy", .null), ("scope", .null)]), localDep "leaf" "leaf" true]
+  manifest (project / "parent") #[localDep "leaf" "../leaf"] [("fixedToolchain", .null)]
+  manifest (project / "leaf") (fields := [("packages", .null)])
+  let r ← report project
+  expectKinds r #[]
+  let parent ← pkg r "parent"
+  expectField parent "fixed_toolchain" false
+  expectField parent "scope" ""
+  expectField (← pkg r "leaf") "path" (chain ["demo", "parent", "leaf"])
 
 private def orphanEdges (project : FilePath) : IO Unit := do
   manifest project #[localDep "orphan" "orphan" true, localDep "leaf" "leaf"]
@@ -118,8 +166,13 @@ private def invalidNestedLock (project : FilePath) : IO Unit := do
   pin (project / "a")
   manifest (project / "a") #[Json.mkObj [("name", "b"), ("type", "path"), ("dir", ".")]]
   IO.FS.createDirAll (project / ".lake")
-  writeJson (project / ".lake" / "package-overrides.json") (Json.mkObj [("packages", .arr #[])])
-  expectKinds (← report project) #["active_overrides", "invalid_manifest"]
+  let file := project / ".lake" / "package-overrides.json"
+  let overrides := Json.mkObj [("schemaVersion", "1.3.0"), ("packages", .arr #[])]
+  writeJson file overrides
+  expectKinds (← report project) #["invalid_manifest"]
+  for value in [overrides.setObjVal! "packages" (.arr #[localDep "a" "elsewhere"]), Json.mkObj []] do
+    writeJson file value
+    expectKinds (← report project) #["active_overrides", "invalid_manifest"]
 
 private def legacyManifest (project : FilePath) : IO Unit := do
   let repo := project / "lake-packages" / "my-lib"
@@ -178,6 +231,7 @@ private def invalidRoot (project : FilePath) : IO Unit := do
     check (msg.contains "lake-manifest.json") msg
   checkError
   for entry in [Json.mkObj [("type", "path"), ("dir", "x")], gitDep "a" "aa" (fields := [("scope", .arr #[])]),
+      localDep "a" "a" (fields := [("inherited", .null)]),
       gitDep "../a" "aa", Json.mkObj [("name", "a"), ("type", "git"), ("inherited", "false")]] do
     manifest project #[entry]
     checkError
@@ -188,8 +242,10 @@ def run : IO Unit := do
   runCase "local dependencies and custom Git manifest" customManifest
   runCase "equivalent Git subdirectories" gitSubdirectories
   runCase "external package toolchain boundary" externalPin
+  runCase "nested project inherits its enclosing toolchain" enclosingToolchain
   runCase "unreachable dependency" missingAncestry
   runCase "missing child locks" missingLocks
+  runCase "null Lake manifest defaults" nullDefaults
   runCase "unreachable parent edges" orphanEdges
   runCase "invalid nested lock and active overrides" invalidNestedLock
   runCase "legacy tagged manifest" legacyManifest
