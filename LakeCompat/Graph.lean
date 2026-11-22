@@ -438,20 +438,35 @@ private def localRemotePath? (url : String) : Option FilePath := do
   guard (!decoded.contains (Char.ofNat 0) && !decoded.startsWith "/~")
   if Platform.isWindows then Uri.fileUriToPath? url else return ⟨decoded⟩
 
-private def sameRemote (project : FilePath) (a b : String) : IO Bool := do
-  if a == b then return true
-  if let some (ao, ar) := Source.githubRepo? a then
-    let some (bo, br) := Source.githubRepo? b | return false
-    return ao.toLower == bo.toLower && ar.toLower == br.toLower
-  let some left := localRemotePath? a | return false
-  let some right := localRemotePath? b | return false
+private inductive Remote where
+  | github (owner repo : String)
+  | local (path : FilePath)
+  deriving BEq
+
+private abbrev SameRemote := String → String → IO Bool
+
+private def resolveRemote (project : FilePath) (url : String) : IO (Option Remote) := do
+  if let some (owner, repo) := Source.githubRepo? url then
+    return some (.github owner.toLower repo.toLower)
+  let some path := localRemotePath? url | return none
   -- Lake materializes inherited Git URLs from the workspace, even for nested packages.
-  let resolve := fun (path : FilePath) => do
-    let path := project / path
-    unless ← path.pathExists do return none
-    return (← (IO.FS.realPath path).toBaseIO).toOption
-  let some left ← resolve left | return false
-  return (← resolve right) == some left
+  let path := project / path
+  unless ← path.pathExists do return none
+  return (← (IO.FS.realPath path).toBaseIO).toOption.map Remote.local
+
+/-- Shared dependencies repeat the same repository URLs on many edges. Resolve each
+URL once per scan, including absent local repositories and unsupported remotes. -/
+private def remoteComparer (project : FilePath) : IO SameRemote := do
+  let cache ← IO.mkRef (∅ : Std.HashMap String (Option Remote))
+  let resolve := fun url => do
+    if let some cached := (← cache.get)[url]? then return cached
+    let remote ← resolveRemote project url
+    cache.modify (·.insert url remote)
+    return remote
+  return fun a b => do
+    if a == b then return true
+    let some left ← resolve a | return false
+    return (← resolve b) == some left
 
 private def differentSubdirs (a b : Option String) : Bool :=
   a != b && Source.directoryKey (a.getD "") != Source.directoryKey (b.getD "")
@@ -466,7 +481,7 @@ private structure EdgeSources where
   equivalentSubdirs : Std.HashSet (String × String) := ∅
 
 private def sourcePaths (project packages : FilePath) (repos : Repositories) (env : GitTree.Env)
-    (observations : Observations) (known : SourcePaths) : IO EdgeSources := do
+    (observations : Observations) (known : SourcePaths) (sameRemote : SameRemote) : IO EdgeSources := do
   let mut requested : Std.HashSet SourceQuery := ∅
   for (_, parent) in observations do
     for (child, wanted) in parent.edges do
@@ -484,7 +499,7 @@ private def sourcePaths (project packages : FilePath) (repos : Repositories) (en
         if selected.origin.isSome && differentSubdirs sub rootSub &&
             !(FilePath.mk dir).isAbsolute && !(FilePath.mk rootDir).isAbsolute &&
             rev.toLower == rootRev.toLower then
-          if ← sameRemote project url rootUrl then requested := requested.insert (.gitSubdir child dir)
+          if ← sameRemote url rootUrl then requested := requested.insert (.gitSubdir child dir)
       | _, _ => pure ()
   let queries : Array (DirectoryQuery SourceQuery) := requested.toArray.map fun key =>
     match key with
@@ -505,13 +520,13 @@ private def sourcePaths (project packages : FilePath) (repos : Repositories) (en
   return sources
 
 private def conflict (parent : Observation) (wanted selected : LockedPackage) (project : FilePath)
-    (sources : EdgeSources) : IO (Option Issue) := do
+    (sources : EdgeSources) (sameRemote : SameRemote) : IO (Option Issue) := do
   let name := parent.entry.name
   match wanted.source, selected.source with
   | .git url rev sub _, .git rootUrl rootRev rootSub _ =>
     if rev.toLower != rootRev.toLower then
       return some ("revision_conflict", s!"{name} locks {rev}. The root selects {rootRev}.")
-    unless ← sameRemote project url rootUrl do
+    unless ← sameRemote url rootUrl do
       return some ("source_conflict", s!"{name} locks repository {url}. The root locks {rootUrl}.")
     if differentSubdirs sub rootSub &&
         !sources.equivalentSubdirs.contains (selected.name, sub.getD "") then
@@ -569,7 +584,8 @@ def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Jso
   let env ← if repos.exact.isEmpty then pure #[] else GitTree.environment
   let (observations, known) ← observe project packagesDir workspaceRoot lock repos env
   let paths := shortestPaths root observations
-  let sources ← sourcePaths project packagesDir repos env observations known
+  let sameRemote ← remoteComparer project
+  let sources ← sourcePaths project packagesDir repos env observations known sameRemote
   let mut packages := #[]
   let mut findings := #[]
   if let some message ← packageOverridesIssue? lakeDir then
@@ -589,7 +605,7 @@ def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Jso
     for (child, wanted) in obs.edges do
       let selected := lock.packages[child]?
       let issue ← match selected with
-        | some selected => conflict obs wanted selected project sources
+        | some selected => conflict obs wanted selected project sources sameRemote
         | none => pure <| some ("unlocked_dependency", s!"{name} locks {child}, which is absent from the root manifest.")
       if let some issue := issue then
         let detail := Json.mkObj [("parent", name), ("requested_revision", toJson wanted.source.revision?),

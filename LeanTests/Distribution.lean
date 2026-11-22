@@ -43,6 +43,14 @@ private def archiveTest (root temp : FilePath) : IO Unit := do
     "standalone executable failed to locate the bundled demo"
   check (← empty.readDir).isEmpty "standalone scan left files in the caller's directory"
 
+  let smoke ← binary "release-smoke"
+  let version := (← IO.FS.readFile (root / "VERSION")).trimAscii.copy
+  let checked ← IO.Process.output {cmd := smoke.toString, args := #[archive.toString, version], cwd := temp}
+  check (checked.exitCode == 0) s!"native release smoke check failed: {checked.stdout}{checked.stderr}"
+  let wrong ← IO.Process.output {cmd := smoke.toString, args := #[archive.toString, "incorrect"], cwd := temp}
+  check (wrong.exitCode != 0 && wrong.stderr.contains "Unexpected release version")
+    "native release smoke check accepted the wrong version"
+
   if !Platform.isWindows then
     let fake := temp / "fake tar"
     IO.FS.createDir fake

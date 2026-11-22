@@ -20,6 +20,16 @@ name = "workspaceInspector"
 path = "scripts/inspect-workspace.lean"
 text = true
 
+[[input_file]]
+name = "reportSchema"
+path = "schema/report-v1.json"
+text = true
+
+[[input_file]]
+name = "buildToolchain"
+path = "lean-toolchain"
+text = true
+
 [[input_dir]]
 name = "demoSources"
 path = "examples/upgrade-demo"
@@ -33,6 +43,12 @@ needs = ["demoSources", "releaseVersion", "workspaceInspector"]
 [[lean_lib]]
 name = "LeanTests"
 globs = ["LeanTests.+"]
+needs = ["reportSchema"]
+
+[[lean_lib]]
+name = "Tools"
+globs = ["Tools.+"]
+needs = ["buildToolchain"]
 
 [[lean_exe]]
 name = "lake-compat"
@@ -43,10 +59,32 @@ moreLinkArgs = ["-linitialize_minimal"]
 [[lean_exe]]
 name = "lake-compat-tests"
 root = "LeanTests.Main"
-needs = ["lake-compat", "package-release"]
+needs = ["lake-compat", "package-release", "benchmark-scans", "release-smoke"]
 moreLinkArgs = ["-linitialize_minimal"]
 
 [[lean_exe]]
 name = "package-release"
 root = "PackageRelease"
+moreLinkArgs = ["-linitialize_minimal"]
+
+[[lean_exe]]
+name = "benchmark-scans"
+root = "Tools.BenchmarkScans"
+needs = ["lake-compat"]
+moreLinkArgs = ["-linitialize_minimal"]
+
+[[lean_exe]]
+name = "check-report-schema"
+root = "Tools.CheckReportSchema"
+needs = ["lake-compat", "lake-compat-tests"]
+moreLinkArgs = ["-linitialize_minimal"]
+
+[[lean_exe]]
+name = "release-compat"
+root = "Tools.ReleaseCompat"
+moreLinkArgs = ["-linitialize_minimal"]
+
+[[lean_exe]]
+name = "release-smoke"
+root = "Tools.ReleaseSmoke"
 moreLinkArgs = ["-linitialize_minimal"]

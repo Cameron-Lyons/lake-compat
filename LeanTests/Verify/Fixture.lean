@@ -155,6 +155,13 @@ private def fakeBuild (scenario : String) (project : FilePath) : IO UInt32 := do
       write path "-- staged only"
       discard <| git checkout #["add", file]
       write path original
+  | "many-pins" | "many-dirty" =>
+    for entry in LakeCompat.Report.rows (← readJson "lake-manifest.json") "packages" do
+      let name := field entry "name"
+      let checkout := FilePath.mk ".lake/packages" / name
+      discard <| IO.Process.run {cmd := "git", args := #["clone", "-q", (root / "dep").toString, checkout.toString]}
+      if scenario == "many-dirty" && ["beta", "gamma"].contains name then
+        write (checkout / "Main.lean") "-- changed"
   | "tagged" =>
     let entry := (LakeCompat.Report.rows (← readJson "lake-manifest.json") "packages")[0]!.getObjValD "git"
     let revision ← git (root / "sha256-dep") #["rev-parse", "HEAD"]

@@ -131,6 +131,8 @@ def parseOptions (args : List String) : Except String Options := do
   if let some flag := pending then throw s!"{flag} requires a value"
   if opts.target.isEmpty then throw "expected a target Lean toolchain, for example 4.36.0"
   if opts.demo && opts.project.isSome then throw "--project and --demo are mutually exclusive"
+  if opts.buildTimeoutSeconds.isSome && !opts.verify && !opts.trySuggested && opts.revisions.isEmpty then
+    throw "--build-timeout requires a trial: use --verify, --test, --build-target, --try-suggested, or --try-revision"
   return opts
 
 end LakeCompat
