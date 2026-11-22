@@ -30,7 +30,7 @@ def writeJson (path : FilePath) (value : Json) : IO Unit :=
 /-- Output-directory report for a fixture's root package in the current trial. -/
 def writeTrialOutputDirs (output : FilePath) : IO Unit := do
   let build := (← IO.currentDir) / ".lake/build"
-  let record := Json.mkObj [("name", "app"), ("buildDir", build.toString),
+  let record := Json.mkObj [("name", "app"), ("hasDefaultTargets", true), ("buildDir", build.toString),
     ("leanLibDir", (build / "lib/lean").toString), ("nativeLibDir", (build / "lib").toString),
     ("binDir", (build / "bin").toString), ("irDir", (build / "ir").toString)]
   writeJson output (.arr #[record])

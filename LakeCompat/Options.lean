@@ -1,4 +1,5 @@
 import Init.System.FilePath
+import Lean.Data.Name
 import LakeCompat.Source
 
 namespace LakeCompat
@@ -13,7 +14,7 @@ Explain which locked dependencies need attention for a Lean upgrade.
   --verify                 Build the project's default targets on this toolchain
   --test                   Run the project's Lake test driver after a successful build
   -- ARGS...               With --test, pass remaining arguments to the test driver
-  --build-target TARGET    Build a named target, module source file, or package facet (repeatable)
+  --build-target TARGET    Build a target, module source file, @package defaults, or facet (repeatable)
   --try-suggested          Build a trial with each package's top candidate
   --try-revision NAME=SHA  Try a full Git commit; repeat to combine changes
   --build-timeout SECONDS  Time allowed for each build or test step (default 600 seconds)
@@ -37,16 +38,25 @@ structure Options where
   strict : Bool := false
   deriving Inhabited
 
-/-- Pass relative module paths and package facets to Lake. Qualify named targets so
+/-- A standalone Lake package selector requests all of that package's default targets. -/
+def defaultPackage? (spec : String) : Option String := do
+  let name ← spec.dropPrefix? "@"
+  guard (!name.isEmpty && !name.contains '/' && !name.contains ':')
+  return name.copy
+
+/-- Pass relative module paths and package selectors to Lake. Qualify named targets so
 a bare name selects a target in the root package. -/
 def buildTargetSpec (value : String) : Except String String := do
   let invalid := "--build-target expects a Lake target such as MyLib, @package/MyLib, src/Main.lean:olean, or :extraDep"
   if value.trimAscii.isEmpty || value.startsWith "-" || value.any (· < ' ') then throw invalid
+  if (defaultPackage? value).isSome then return value
   let (base, facet) ← match value.splitOn ":" with
     | [base] => pure (base, "")
-    | [base, facet] => pure (base, ":" ++ facet)
+    | [base, facet] => do
+      -- Lake treats an unparseable facet as the anonymous (default) facet.
+      if facet.contains '/' || (!facet.isEmpty && facet.toName.isAnonymous) then throw invalid
+      pure (base, ":" ++ facet)
     | _ => throw invalid
-  if facet.contains '/' then throw invalid
   if base.endsWith ".lean" && !base.startsWith "@" && !base.startsWith "+" then
     if (System.FilePath.mk base).isAbsolute || base.startsWith "../" then throw invalid
     return value

@@ -1,6 +1,7 @@
 import Lean.Data.Json.Parser
 import Lean.Data.Json.Printer
 import Lake.Load.Manifest
+import Std.Data.HashSet
 import Std.Data.TreeMap
 
 namespace LakeCompat
@@ -139,8 +140,8 @@ private def supportedVersion : Json → Bool
     (Lake.StdVer.parse version).toOption.any fun v => v.major == 1 || (v.major == 0 && v.minor >= 5)
   | _ => false
 
-/-- Decode the semantic-versioned lock and the earlier tagged formats used by Lake. -/
-def Lock.ofJson (file : FilePath) (raw : Json) : Except String Lock := Except.mapError (s!"{file}: {·}") <| do
+/-- Decode all entries, optionally retaining only the direct requirements of a nested manifest. -/
+def Lock.ofJson (file : FilePath) (raw : Json) (directOnly := false) : Except String Lock := Except.mapError (s!"{file}: {·}") <| do
   unless raw.getObj?.isOk do throw "expected a Lake manifest object"
   let version := (raw.getObjVal? "version").toOption.getD (raw.getObjValD "schemaVersion")
   unless supportedVersion version do throw s!"unsupported Lake manifest version {version.compress}"
@@ -152,14 +153,17 @@ def Lock.ofJson (file : FilePath) (raw : Json) : Except String Lock := Except.ma
     | .null => pure #[]
     | v => v.getArr?.mapError fun _ => "expected a packages array"
   let mut packages : PackageMap := ∅
+  let mut names := Std.HashSet.emptyWithCapacity entries.size
   for entry in entries do
     let p ← decodePackage entry
-    if packages.contains p.name then throw s!"duplicate package {repr p.name}"
-    packages := packages.insert p.name p
+    let (duplicate, updated) := names.containsThenInsert p.name
+    if duplicate then throw s!"duplicate package {repr p.name}"
+    names := updated
+    unless directOnly && p.inherited do packages := packages.insert p.name p
   return ⟨name, lakeDir, packagesDir, fixedToolchain, packages⟩
 
-def Lock.parse (file : FilePath) (contents : String) : Except String Lock := do
+def Lock.parse (file : FilePath) (contents : String) (directOnly := false) : Except String Lock := do
   let raw ← (Json.parse contents).mapError (s!"{file}: {·}")
-  Lock.ofJson file raw
+  Lock.ofJson file raw directOnly
 
 end LakeCompat

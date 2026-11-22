@@ -1,6 +1,7 @@
 import LakeCompat.Verify.Trial
 import Lake.Build.ModuleArtifacts
 import Lake.Util.Log
+import Lake.Util.Name
 
 open Lean System
 
@@ -27,6 +28,7 @@ def Trial.needsOutputInspection (trial : Trial) (workspace : FilePath) : IO Bool
 
 private structure PackageOutputs where
   name : String
+  hasDefaultTargets : Bool
   buildDir : FilePath
   leanLibDir : FilePath
   nativeLibDir : FilePath
@@ -51,10 +53,16 @@ private def outputInside (workspace path : FilePath) : IO Bool := do
         unless isInside workspace dir do return false
   return true
 
-def checkedLibraryDirs (workspace : FilePath) (result : Json) : IO (Array FilePath) := do
+def checkedLibraryDirs (workspace : FilePath) (result : Json) (defaultPackages : Array String := #[]) :
+    IO (Array FilePath) := do
   let packages ← IO.ofExcept (fromJson? (α := Array PackageOutputs) result)
   if packages.isEmpty then throw <| IO.userError "Lake reported an empty trial workspace."
+  let requested := Std.HashSet.ofArray <| defaultPackages.map fun name =>
+    (Lake.stringToLegalOrSimpleName name).toString (escape := false)
   for pkg in packages do
+    -- Lake can silently fall back to the root defaults when a package has none.
+    if requested.contains pkg.name && !pkg.hasDefaultTargets then
+      throw <| IO.userError s!"Package {pkg.name} has no default build targets. Select one with --build-target @{pkg.name}/NAME."
     for path in #[pkg.buildDir, pkg.leanLibDir, pkg.nativeLibDir, pkg.binDir, pkg.irDir] do
       unless ← outputInside workspace path do
         throw <| IO.userError s!"Package {pkg.name} configures a build output directory outside the trial workspace: {path}"

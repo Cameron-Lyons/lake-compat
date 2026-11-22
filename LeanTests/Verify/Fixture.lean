@@ -161,7 +161,10 @@ private def fakeBuild (scenario : String) (project : FilePath) : IO UInt32 := do
     check (field entry "rev" == revision && field entry "inputRev?" == revision) "tagged SHA-256 pins"
     check (!(entry.getObjVal? "inputRev").isOk && entry.getObjValD "extra" == Json.mkObj [("keep", true)])
       "tagged entry fields changed"
-    discard <| IO.Process.run {cmd := "git", args := #["clone", "-q", field entry "url", ".lake/packages/dep"]}
+    let checkout := ".lake/packages/dep"
+    check ((← git checkout #["rev-parse", "--show-object-format"]) == "sha256") "incorrect checkout object format"
+    discard <| git checkout #["fetch", "-q", field entry "url", revision]
+    discard <| git checkout #["checkout", "-q", "--detach", "FETCH_HEAD"]
   | "pass" | "check-empty" | "check-change" => pure ()
   | _ => throw <| IO.userError s!"unrecognized fake build {scenario}"
   return 0

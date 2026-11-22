@@ -18,6 +18,18 @@ private def run (args : Array String) (cwd : FilePath) (env : Environment) (ms :
     throw <| IO.userError s!"{operation} exceeded its {limit} command timeout."
   return result
 
+/-- Lake initializes fresh repositories using Git's default object format. A 64-character
+lock needs a SHA-256 repository before Lake fetches it, even alongside SHA-1 packages. -/
+private def initializeSha256Checkouts (workspace : FilePath) (trial : Trial)
+    (env : Environment) (detail : IO.Ref Json) : IO Unit := do
+  for (name, revision) in trial.pins do
+    if revision.utf8ByteSize == 64 then
+      let repo := workspace / trial.packagesDir / name
+      let result ← run #["git", "init", "--quiet", "--object-format=sha256", "--", repo.toString] workspace env 10000 detail
+      if result.exitCode != 0 then
+        detail.modify (·.setObjVal! "output" (.str result.output))
+        throw <| IO.userError s!"Git could not initialize a SHA-256 checkout for {name}."
+
 private def confirmGit (root packagesDir : FilePath) (pins : Pins) (env : Environment) (detail : IO.Ref Json) : IO Unit := do
   if pins.isEmpty then return
   let some cache ← isolatedDirectory root packagesDir
@@ -47,11 +59,13 @@ private def writeInput (dst : FilePath) (value : String) : IO Unit := do
   if (← metadata? dst).isSome then IO.FS.removeFile dst
   IO.FS.writeFile dst value
 
-/-- A bare filename can also name a Lake declaration. Keep the root-package lookup
-for that case, so a missing file cannot accidentally select a dependency's target. -/
+/-- An unqualified filename can also name a root declaration. Make paths with a
+directory explicit so a missing source cannot select a dependency's named target. -/
 private def resolveBuildTarget (workspace : FilePath) (spec : String) : IO String := do
   let base := (spec.takeWhile (· != ':')).copy
-  if base.endsWith ".lean" && !base.contains '/' then
+  if base.endsWith ".lean" && !base.startsWith "@" then
+    if base.startsWith "./" then return spec
+    if base.contains '/' then return "./" ++ spec
     if (← (workspace / base).metadata.toBaseIO).toOption.any (·.type == .file) then return "./" ++ spec
     return "@/" ++ spec
   return spec
@@ -110,7 +124,7 @@ private def configuredPackagesDir (project parent : FilePath) (target : String) 
 /-- The target Lake resolves every active package in the copied workspace. A null
 result records a workspace load error. A failure to run the inspector is inconclusive. -/
 private def prepareOutputs (workspace : FilePath) (trial : Trial) (lake : Array String)
-    (env : Environment) (detail : IO.Ref Json) (timeoutMs : Nat) : IO Bool := do
+    (env : Environment) (detail : IO.Ref Json) (timeoutMs : Nat) (defaultPackages : Array String) : IO Bool := do
   let parent := workspace.parent.get!
   let inspector := parent / "inspector"
   IO.FS.createDir inspector
@@ -124,7 +138,7 @@ private def prepareOutputs (workspace : FilePath) (trial : Trial) (lake : Array 
     if (← (IO.FS.readFile output).toBaseIO).toOption == some "null" then return false
     throw <| IO.userError "The target Lake could not inspect the package output directories."
   let result ← IO.ofExcept <| Json.parse (← IO.FS.readFile output)
-  invalidateModuleCaches workspace trial (← checkedLibraryDirs workspace result)
+  invalidateModuleCaches workspace trial (← checkedLibraryDirs workspace result defaultPackages)
   return true
 
 private def verifyTrial (parent project : FilePath) (target : String) (revisions : Pins)
@@ -140,14 +154,16 @@ private def verifyTrial (parent project : FilePath) (target : String) (revisions
   let trial ← prepareTrial project workspace revisions (configuredPackagesDir project parent target lake env detail)
     expectedManifest
   trial.checkLocalPaths workspace false
+  initializeSha256Checkouts workspace trial env detail
   let pinFile := workspace / "lean-toolchain"
   let lockFile := workspace / manifestName
   let lockContents := trial.manifest.pretty ++ "\n"
   writeInput pinFile (target ++ "\n")
   writeInput lockFile lockContents
   detail.modify (·.setObjVal! "lake_version" (.str version.output))
-  if ← trial.needsOutputInspection workspace then
-    let loaded ← prepareOutputs workspace trial lake env detail buildTimeoutMs
+  let defaultPackages := targetSpecs.filterMap defaultPackage?
+  if !defaultPackages.isEmpty || (← trial.needsOutputInspection workspace) then
+    let loaded ← prepareOutputs workspace trial lake env detail buildTimeoutMs defaultPackages
     checkTrialInputs workspace trial lockContents target
     unless loaded do return report "failed" "Lake could not load the trial workspace." (← detail.get)
     if let some message ← packageOverridesIssue? (workspace / ".lake") then throw <| IO.userError message

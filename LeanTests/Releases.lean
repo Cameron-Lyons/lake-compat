@@ -157,11 +157,23 @@ private def testFailures : IO Unit := do
     (fetch := fun _ => pure ((metadata).setObjVal! "name" .null))
   check (status badName == "unavailable") "invalid package metadata must not look like a different package"
   for bad in [Json.mkObj [], dataRows #[.null], dataRows #[((build (rev 'c')).setObjVal! "runAt" 7)],
-      dataRows #[((build (rev 'c')).setObjVal! "built" .null)],
+      dataRows #[Json.mkObj [("revision", rev 'c'), ("toolchain", target)]],
       dataRows #[((build (rev 'c')).setObjVal! "built" "false")]] do
     let report ← suggestVersions url target (some "mathlib") (fetch := fun req =>
       pure (if req == endpoint then metadata else if req.endsWith "/versions" then dataRows #[] else bad))
     check (status report == "unavailable") "malformed records must not produce no_match"
+
+private def testUnreportedBuilds : IO Unit := do
+  let unreported := fun revision => (build revision [("runAt", "2026-11-02")]).setObjVal! "built" .null
+  let versions := #[version (rev 'a') none, version (rev 'c') none]
+  let builds := #[build (rev 'b'), build (rev 'c') [] false,
+    unreported (rev 'a'), unreported (rev 'b'), unreported (rev 'c'), unreported (rev 'd')]
+  let report ← suggestVersions url target (some "mathlib") (fetch := fixture endpoint metadata versions builds)
+  check (status report == "found" && (report.getObjValD "unavailable_history").isNull) report.compress
+  let candidates := rows report
+  check (candidates.map (·.getObjValD "revision") == #[rev 'b', rev 'a'].map Json.str &&
+    candidates.map (·.getObjValD "evidence") == #["built", "declared"].map Json.str)
+    "unreported outcomes must preserve recorded successes, failures and declarations"
 
 private def testRegistryResponses : IO Unit := do
   let lookup := fun (pkg versions builds : Json) =>
@@ -207,6 +219,7 @@ def run : IO Unit := do
   testTiedEvidence
   testIdentity
   testFailures
+  testUnreportedBuilds
   testRegistryResponses
   testPartialHistory
 

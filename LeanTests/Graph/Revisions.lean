@@ -44,6 +44,49 @@ private def archiveBoundary (project : FilePath) : IO Unit := do
     expectKinds r #[kind]
     expectField (← pkg r "archive") "toolchain" .null
 
+private def archiveMetadata (project : FilePath) : IO Unit := do
+  let repo := packagesDir project / "archive"
+  let config := repo / "config"
+  pin config
+  manifest config
+  link (repo / "lean-toolchain") "config/lean-toolchain"
+  link (repo / "lake-manifest.json") "config/lake-manifest.json"
+  manifest project #[gitDep "archive" (fakeRevision 'a')]
+  let internal ← report project
+  expectKinds internal #["unknown_checkout_revision"]
+  expectField (← pkg internal "archive") "toolchain" target
+  let other := project / "other"
+  pin other
+  manifest other #[localDep "unrelated" "."]
+  for file in ["lean-toolchain", "lake-manifest.json"] do
+    IO.FS.removeFile (repo / file)
+    link (repo / file) (other / file)
+  let external ← report project
+  expectKinds external #["unknown_checkout_revision", "unknown_toolchain", "invalid_manifest"]
+  expectField (← pkg external "archive") "toolchain" .null
+
+private def archiveToCheckout (project : FilePath) : IO Unit := do
+  let archive := packagesDir project / "archive"
+  pin archive
+  manifest archive
+  let repo := packagesDir project / "locked"
+  pin repo
+  manifest repo
+  for dir in ["before", "after"] do manifest (repo / dir)
+  pin (repo / "before") older
+  link (repo / "alias") "before"
+  let rev ← commitMetadata repo
+  IO.FS.removeFile (repo / "alias")
+  link (repo / "alias") "after"
+  link (archive / "next") "../locked/alias"
+  manifest project #[gitDep "archive" (fakeRevision 'a'), gitDep "locked" rev,
+    localDep "local" ".lake/packages/archive/next"]
+  let r ← report project
+  let localPkg ← pkg r "local"
+  expectField localPkg "toolchain" older
+  expectField localPkg "checkout" (repo / "before").toString
+  expectKinds r #["unknown_checkout_revision", "unknown_checkout_revision", "toolchain_mismatch"]
+
 private def incompleteCheckout (project : FilePath) : IO Unit := do
   manifest project
   let workspaceRev ← commitMetadata project
@@ -195,6 +238,8 @@ def run : IO Unit := do
   runCase "dirty and deleted locked metadata" dirtyCheckout
   runCase "archive provenance" archive
   runCase "archive boundary" archiveBoundary
+  runCase "archive metadata symlink boundaries" archiveMetadata
+  runCase "path from an archive into a locked checkout" archiveToCheckout
   runCase "incomplete checkout in another repository" incompleteCheckout
   runCase "working tree of path dependency" localEdits
   runCase "workspace-relative and absolute Git remotes" localRemotes

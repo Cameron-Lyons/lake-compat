@@ -13,6 +13,39 @@ private def implicitEmpty (target : String) : IO Unit := withProject fun project
   expect result "passed"
   check (result.getObjValD "checked_revisions" == Json.mkObj []) result.compress
 
+private def mixedGitFormats (target : String) : IO Unit := withProject fun project => do
+  let mut entries := #[]
+  let mut expected := Json.mkObj []
+  let mut config := appConfig ++ "packagesDir = \"vendor\"\n" ++ mainLibrary
+  for (name, moduleName, format) in [("modern", "Modern", "sha256"), ("classic", "Classic", "sha1")] do
+    let repo := project.parent.get! / name
+    let init ← IO.Process.output {cmd := "git", args := #["init", "-q", "--object-format=" ++ format, repo.toString]}
+    if init.exitCode != 0 then
+      if name == "modern" then
+        IO.println s!"Skipping mixed Git object formats: {init.stderr}"
+        return
+      throw <| IO.userError init.stderr
+    write (repo / "lakefile.toml") s!"name = \"{name}\"\n[[lean_lib]]\nname = \"{moduleName}\"\n"
+    write (repo / (moduleName ++ ".lean")) s!"def {name} := 1\n"
+    discard <| git repo #["add", "."]
+    discard <| git repo #["commit", "-qm", name]
+    let rev ← git repo #["rev-parse", "HEAD"]
+    let url := "../" ++ name
+    entries := entries.push (gitEntry name url rev)
+    expected := expected.setObjVal! name (.str rev)
+    config := config ++ s!"[[require]]\nname = \"{name}\"\ngit = \"{url}\"\nrev = \"{rev}\"\n"
+  write (project / "lakefile.toml") config
+  write (project / "Main.lean") "import Modern\nimport Classic\nexample : modern + classic = 2 := rfl\n"
+  writeJson (project / "lake-manifest.json") ((manifest entries).setObjVal! "packagesDir" "vendor")
+  let configDir := project.parent.get! / "config"
+  write (configDir / "git/config") "[init]\n\tdefaultObjectFormat = sha256\n"
+  let output ← cli #[target, "--project", project.toString, "--verify", "--json"]
+    #[("XDG_CONFIG_HOME", some configDir.toString)]
+  check (output.exitCode == 0) (output.stdout ++ output.stderr)
+  let result := (← IO.ofExcept (Json.parse output.stdout)).getObjValD "verification"
+  expect result "passed"
+  check (result.getObjValD "checked_revisions" == expected && !(← (project / "vendor").pathExists)) result.compress
+
 private def staleModuleCache (target : String) : IO Unit := withProject fun project => do
   write (project / "lakefile.toml") (appConfig ++ "buildDir = \"out dir\"\nleanLibDir = \"objects\"\n" ++ mainLibrary)
   let objects := project / "out dir/objects"
@@ -218,6 +251,7 @@ def realBuilds : IO Unit := do
     IO.println s!"Skipping real build verification fixtures; elan toolchain {target} is unavailable."
     return
   implicitEmpty target
+  mixedGitFormats target
   staleModuleCache target
   moduleCacheWithColon target
   externalOutputs target
