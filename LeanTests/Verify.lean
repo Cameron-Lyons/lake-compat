@@ -199,6 +199,27 @@ private def taggedSha256 : IO Unit := withProject fun project => do
   expect result "passed"
   check (result.getObjValD "checked_revisions" == Json.mkObj [("dep", .str revision)]) result.compress
 
+private def manyCheckoutPins : IO Unit := withProject fun project => do
+  let repo := project.parent.get! / "dep"
+  write (repo / "Main.lean") "-- locked input"
+  discard <| git repo #["init", "-q"]
+  discard <| git repo #["add", "."]
+  discard <| git repo #["commit", "-qm", "dep"]
+  let revision ← git repo #["rev-parse", "HEAD"]
+  let names := #["gamma", "alpha", "zeta", "beta", "epsilon", "delta"]
+  let entries := names.map fun name => gitEntry name repo.toString revision
+  writeJson (project / "lake-manifest.json") (manifest entries)
+  let passed ← trial project "many-pins"
+  expect passed "passed"
+  check (passed.getObjValD "checked_revisions" == Json.mkObj (names.toList.map fun name => (name, .str revision)))
+    "omitted a checked revision from a concurrent trial"
+  expect (← trial project "many-dirty") "inconclusive" "tracked files in beta"
+  let wrong := entries.map fun entry =>
+    if field entry "name" == "epsilon" then entry.setObjVal! "rev" (.str (String.ofList (List.replicate 40 '0')))
+    else entry
+  writeJson (project / "lake-manifest.json") (manifest wrong)
+  expect (← trial project "many-pins") "inconclusive" "checkout for epsilon"
+
 def run : IO Unit := do
   if Platform.isWindows then return
   isolation
@@ -211,6 +232,7 @@ def run : IO Unit := do
   badRevisions
   checkoutPins
   taggedSha256
+  manyCheckoutPins
   realBuilds
 
 end LeanTests.Verify

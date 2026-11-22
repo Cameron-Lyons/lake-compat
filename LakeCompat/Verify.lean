@@ -30,29 +30,48 @@ private def initializeSha256Checkouts (workspace : FilePath) (trial : Trial)
         detail.modify (·.setObjVal! "output" (.str result.output))
         throw <| IO.userError s!"Git could not initialize a SHA-256 checkout for {name}."
 
+private def confirmCheckout (cache : FilePath) (name expected : String)
+    (env : Environment) (detail : IO.Ref Json) : IO Unit := do
+  let repo := cache / name
+  unless (← metadata? repo).any (·.type == .dir) && (← metadata? (repo / ".git")).any (·.type == .dir) do
+    throw <| IO.userError s!"Lake did not materialize an isolated checkout of {name}."
+  -- A clean porcelain v2 status includes the full HEAD and no changed-file records.
+  let status ← run #["git", "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--no-ahead-behind",
+    "--untracked-files=no", "--no-renames"] repo env 30000 detail
+  let lines := status.output.splitOn "\n"
+  if status.exitCode == 0 && lines.head? == some s!"# branch.oid {expected}" then
+    if lines.all (·.startsWith "# ") then return
+  else
+    -- A large dirty status can scroll its HEAD out of the bounded command log.
+    let head ← run #["git", "rev-parse", "--verify", "HEAD"] repo env 10000 detail
+    if head.exitCode != 0 || head.output != expected then
+      throw <| IO.userError s!"The checkout for {name} does not match its locked revision {expected}."
+  -- An index change and an unstaged change can cancel out in the actual build inputs.
+  let diff ← run #["git", "diff", "--quiet", "--no-ext-diff", "HEAD", "--"] repo env 30000 detail
+  if diff.exitCode != 0 then
+    throw <| IO.userError s!"Could not confirm that the tracked files in {name} match its locked revision."
+
 private def confirmGit (root packagesDir : FilePath) (pins : Pins) (env : Environment) (detail : IO.Ref Json) : IO Unit := do
   if pins.isEmpty then return
   let some cache ← isolatedDirectory root packagesDir
     | throw <| IO.userError s!"Lake did not materialize an isolated package directory at {packagesDir}."
-  for (name, expected) in pins do
-    let repo := cache / name
-    unless (← metadata? repo).any (·.type == .dir) && (← metadata? (repo / ".git")).any (·.type == .dir) do
-      throw <| IO.userError s!"Lake did not materialize an isolated checkout of {name}."
-    -- A clean porcelain v2 status includes the full HEAD and no changed-file records.
-    let status ← run #["git", "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--no-ahead-behind",
-      "--untracked-files=no", "--no-renames"] repo env 30000 detail
-    let lines := status.output.splitOn "\n"
-    if status.exitCode == 0 && lines.head? == some s!"# branch.oid {expected}" then
-      if lines.all (·.startsWith "# ") then continue
-    else
-      -- A large dirty status can scroll its HEAD out of the bounded command log.
-      let head ← run #["git", "rev-parse", "--verify", "HEAD"] repo env 10000 detail
-      if head.exitCode != 0 || head.output != expected then
-        throw <| IO.userError s!"The checkout for {name} does not match its locked revision {expected}."
-    -- An index change and an unstaged change can cancel out in the actual build inputs.
-    let diff ← run #["git", "diff", "--quiet", "--no-ext-diff", "HEAD", "--"] repo env 30000 detail
-    if diff.exitCode != 0 then
-      throw <| IO.userError s!"Could not confirm that the tracked files in {name} match its locked revision."
+  let failure ← Std.Mutex.new (none : Option (Nat × Json))
+  let check := fun ((name, expected), index) => do
+    -- Each worker owns its output. Preserve the same first failure and diagnostic
+    -- even when several independent checkout checks fail in a different order.
+    let output ← IO.mkRef (Json.mkObj [])
+    try
+      confirmCheckout cache name expected env output
+    catch e =>
+      let value ← output.get
+      failure.atomically <| modify fun previous =>
+        if previous.all (fun old => index < old.1) then some (index, value) else previous
+      throw e
+  try
+    discard <| mapConcurrent pins.toArray.zipIdx check
+  catch e =>
+    if let some (_, output) ← failure.atomically get then detail.modify (·.mergeObj output)
+    throw e
 
 private def writeInput (dst : FilePath) (value : String) : IO Unit := do
   -- Replace links and read-only inputs in the copy without changing their targets.

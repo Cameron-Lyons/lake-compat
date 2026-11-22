@@ -28,8 +28,6 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
-      - name: Lint the release compatibility script
-        run: shellcheck scripts/release-compat.sh
 
   test:
     name: Test (${{ matrix.os }})
@@ -51,17 +49,18 @@ jobs:
           use-mathlib-cache: 'false'
       - name: Lint Lean sources and test drivers
         if: runner.os == 'Linux'
-        run: lake --wfail lint --linters=.extra LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main PackageRelease
-      - name: Build the library, CLI, and release packager
-        run: lake --wfail build LakeCompat lake-compat package-release
+        run: >-
+          lake --wfail lint --linters=.extra
+          LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main PackageRelease
+          Tools.Process Tools.BenchmarkScans Tools.CheckReportSchema Tools.ReleaseCompat Tools.ReleaseSmoke
+      - name: Build the library, CLI, and development tools
+        run: >-
+          lake --wfail build LakeCompat lake-compat package-release
+          benchmark-scans check-report-schema release-compat release-smoke
       - name: Run unit, integration, and distribution tests
         run: lake --wfail test
       - name: Validate CLI reports against the published JSON Schema
-        if: runner.os == 'Linux'
-        run: |
-          python3 -m venv "$RUNNER_TEMP/schema-venv"
-          "$RUNNER_TEMP/schema-venv/bin/python" -m pip install 'jsonschema==4.25.1'
-          "$RUNNER_TEMP/schema-venv/bin/python" scripts/check-report-schema.py
+        run: lake exe check-report-schema
       - name: Check the CLI and Lake package versions
         run: |
           test "$(lake exe lake-compat --version)" = "lake-compat $(cat VERSION)"

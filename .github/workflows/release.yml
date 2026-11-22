@@ -49,10 +49,12 @@ jobs:
           archive=$(lake exe package-release "${RUNNER_TEMP}/package")
           mkdir -p release
           mv -- "$archive" "release/lake-compat-$version-$PLATFORM.tar.gz"
+          lake build release-smoke
+          cp .lake/build/bin/release-smoke "release/release-smoke-$PLATFORM"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: native-${{ matrix.platform }}
-          path: release/*.tar.gz
+          path: release/*
           if-no-files-found: error
 
   smoke:
@@ -79,14 +81,8 @@ jobs:
           test "${#archives[@]}" -eq 1
           version=${archives[0]#lake-compat-}
           version=${version%-"$PLATFORM".tar.gz}
-          unpack=$(mktemp -d)
-          tar -xzf "${archives[0]}" -C "$unpack"
-          cd "$unpack"
-          test -s LICENSE
-          test "$(PATH='' ./lake-compat --version)" = "lake-compat $version"
-          PATH='' ./lake-compat 4.36.0 --demo --json |
-            jq -e '.schema_version == 1 and
-              any(.findings[]; .kind == "toolchain_mismatch" and .path == ["upgradeDemo", "greeting"])'
+          chmod +x "release-smoke-$PLATFORM"
+          "./release-smoke-$PLATFORM" "${archives[0]}" "$version"
 
   compatibility:
     needs: package
@@ -113,7 +109,7 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
             revision=$GITHUB_REF_NAME
           fi
-          bash scripts/release-compat.sh "$RUNNER_TEMP/lake-compat" \
+          lake exe release-compat "$RUNNER_TEMP/lake-compat" \
             "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$revision"
 
   publish:

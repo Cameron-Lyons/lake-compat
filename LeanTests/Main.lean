@@ -3,8 +3,10 @@ import LeanTests.Cli
 import LeanTests.Concurrent
 import LeanTests.Distribution
 import LeanTests.Graph
+import LeanTests.JsonSchema
 import LeanTests.Releases
 import LeanTests.Support
+import LeanTests.Tooling
 import LeanTests.Verify
 
 open LakeCompat Lean LeanTests.Support
@@ -24,10 +26,13 @@ def main (args : List String) : IO UInt32 := do
   if let some mode ← IO.getEnv "LAKECOMPAT_CLI_FIXTURE" then return ← LeanTests.Cli.fixture mode args
   if (← IO.getEnv "LAKECOMPAT_TAR_FIXTURE").isSome then return ← LeanTests.Distribution.failTar args
   if let "verify-fixture" :: rest := args then return ← LeanTests.Verify.verifyFixture rest
+  if let "process-fixture" :: rest := args then return ← LeanTests.Tooling.fixture rest
   if args.head? == some "run" && (← IO.getEnv "LAKECOMPAT_TEST_ELAN").isSome then
     return ← LeanTests.Verify.fakeElan args
   toolchains
   LeanTests.Concurrent.run
+  LeanTests.JsonSchema.runTests
+  LeanTests.Tooling.run
   LeanTests.Releases.run
   LeanTests.Cli.run
   LeanTests.Graph.run

@@ -68,6 +68,8 @@ private def inputErrors : IO Unit := withProject fun project => do
   check (missing.contains "lakefile.toml" && !missing.contains "lake update") missing
   discard <| expectError project #["--project", (project / "lean-toolchain").toString] "--project expects a directory"
   discard <| expectError project #["--try-revision", "other=" ++ newRev] "other"
+  for args in [#["--build-timeout", "1"], #["--suggest", "--build-timeout=600"]] do
+    discard <| expectError project args "--build-timeout requires a trial"
   for args in [#["--demo"], #["--try-revision", "lib=main"], #["--unknown"], #["--project="],
       #["--build-timeout"], #["--build-timeout", "0"], #["--build-timeout=0.5"],
       #["--build-target"], #["--build-target="], #["--build-target=--help"], #["--build-target", "@dep/"],

@@ -70,7 +70,7 @@ Automatic trials test one combination and hold the dependency graph fixed. If an
 
 If a manifest omits `packagesDir`, an offline scan looks for checkouts in the default packages directory. For build trials with Git or copied dependencies, the target Lake must support `translate-config` to resolve the omitted directory in a temporary copy. The trial records the resulting project-relative path before fetching or copying packages.
 
-The source snapshot limit is 1 GiB. The build and optional test step each have a ten-minute timeout by default. Use `--build-timeout SECONDS` with any build trial to change it. For example, `lake-compat 4.36.0 --verify --build-timeout 1800` allows half an hour for compilation.
+The source snapshot limit is 1 GiB. The build and optional test step each have a ten-minute timeout by default. Use `--build-timeout SECONDS` with any build trial to change it. For example, `lake-compat 4.36.0 --verify --build-timeout 1800` allows half an hour for compilation. Supplying a build timeout without requesting a trial is an input error.
 
 ## Exit codes
 
@@ -121,22 +121,37 @@ Extract the archive on a compatible host, then run `./lake-compat 4.36.0 --demo`
 
 ## Development checks
 
-CI runs the Lean tests on Ubuntu and macOS. The suite exercises the CLI, Git checkouts, isolated builds, and the packaged executable. Run these checks from the source checkout with Git, elan, and the pinned Lean toolchain installed. Workflow linting uses `actionlint` and `shellcheck`.
+The application, tests, benchmarks, report validation, and release compatibility tools are written in Lean. CI runs the Lean tests on Ubuntu and macOS. The suite exercises the CLI, Git checkouts, isolated builds, and the packaged executable. Run these checks from the source checkout with Git, elan, and the pinned Lean toolchain installed. Workflow linting uses `actionlint`.
 
 ```sh
 actionlint
-shellcheck scripts/release-compat.sh
-lake --wfail lint --linters=.extra LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main PackageRelease
-lake --wfail build LakeCompat lake-compat package-release
+lake --wfail lint --linters=.extra \
+  LakeCompat LakeCompat.Cli LakeCompatMain LeanTests.Main PackageRelease \
+  Tools.Process Tools.BenchmarkScans Tools.CheckReportSchema Tools.ReleaseCompat Tools.ReleaseSmoke
+lake --wfail build LakeCompat lake-compat package-release \
+  benchmark-scans check-report-schema release-compat release-smoke
 lake --wfail test
+lake exe check-report-schema
 lake exe lake-compat "$(cat lean-toolchain)" --demo --verify
 ```
 
-After `lake test`, run `python3 scripts/check-report-schema.py` to validate CLI output against the published JSON Schema. The check uses the built executables and needs Python with `jsonschema` installed. Linux CI runs it with `jsonschema==4.25.1`.
+`lake exe check-report-schema` validates real CLI reports against the published JSON Schema, including successful and failing trials, test drivers, revision suggestions, and input errors. Its Lean validator supports the vocabulary used by this contract and rejects unsupported schema keywords or references. Validator regressions also run in `lake test`. Pass an executable path to check a packaged CLI instead of the local build. No Python packages are required.
+
+To measure offline scan performance, run `lake exe benchmark-scans`. It creates a temporary workspace with 256 packages and 16,384 dependency edges sharing a local Git repository. Fixture setup is excluded from timing. The tool warms each executable, reports median and minimum scan times, and requires complete reports without findings. It needs Git on a POSIX host.
+
+Pass saved and current executables to compare them on the same fixture; every report must be identical. Use `--parents`, `--children`, and `--runs` to vary the workload. This measures repeated local repository comparisons, rather than network requests or compilation.
+
+```sh
+lake exe benchmark-scans /tmp/lake-compat-before .lake/build/bin/lake-compat --runs 7
+```
 
 ## Release process
 
 Set the same version in `VERSION` and `lakefile.toml`, then run the **Native release** workflow manually to test packaging without publishing. It builds both archives, runs them on separate runners without a Lean installation step, and uses the Linux archive to check a pinned RealWorld conflict, a live Reservoir lookup, a Git-backed upgrade trial, and downstream installation from Git.
+
+The workflow builds a native `release-smoke` checker alongside each archive. It validates the archive's license, version, demo report schema, and strict exit code with an empty executable search path. This checker is a CI artifact; published archives still contain only the application and license. Run it locally with `lake exe release-smoke ARCHIVE VERSION`.
+
+Run those compatibility checks locally with `lake exe release-compat /absolute/path/to/lake-compat`. This needs network access and both Lean 4.34.1 and the project's toolchain installed in elan. Append a repository URL and revision to also exercise downstream Git installation. The tool creates temporary projects and checks that upgrade verification leaves the original lock unchanged.
 
 The same workflow runs for a matching `v<VERSION>` tag and publishes the tested archives and checksums after all gates pass. A tag such as `v1.0.0-rc.1` creates a GitHub prerelease. Promote a candidate to a stable release after its checks pass and release-blocking issues are resolved.
 
