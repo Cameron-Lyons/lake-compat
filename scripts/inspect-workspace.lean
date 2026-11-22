@@ -17,7 +17,8 @@ script inspect (args) do
     IO.FS.writeFile output "null"
     return 1
   let packages := ws.packages.map fun pkg => Json.mkObj [
-    ("name", toJson pkg.prettyName), ("buildDir", toJson pkg.buildDir),
+    ("name", toJson pkg.prettyName), ("hasDefaultTargets", toJson (!pkg.defaultTargets.isEmpty)),
+    ("buildDir", toJson pkg.buildDir),
     ("leanLibDir", toJson pkg.leanLibDir), ("nativeLibDir", toJson pkg.staticLibDir),
     ("irDir", toJson pkg.irDir), ("binDir", toJson pkg.binDir)]
   IO.FS.writeFile output (Json.arr packages).compress

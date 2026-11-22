@@ -73,31 +73,36 @@ private def checkDirectoryCycles (edges : Edges) : IO Unit := do
       if n == 0 then ready := ready.push child
   if visited != counts.size then throw <| IO.userError "Directory symlinks create a traversal cycle."
 
-private def validateSnapshot (root : FilePath) : IO Unit := do
-  let mut stack := #[root]
-  let mut edges : Edges := ∅
+private def validateSnapshot (root : FilePath) (copiedFiles : Option (Array FilePath)) : IO Unit := do
+  let paths ← match copiedFiles with
+    | some files => pure files
+    | none => do
+      -- For a large snapshot, find can filter ordinary entries by directory entry type.
+      let names ← IO.Process.run {cmd := "find", args := #[root.toString, "!", "-type", "d", "!", "-type", "f", "-print0"]}
+      pure <| ((names.splitOn (String.singleton (Char.ofNat 0))).filter (!·.isEmpty)).toArray.map FilePath.mk
   let mut links := #[]
-  while let some dir := stack.back? do
-    stack := stack.pop
-    let mut children := #[]
-    for entry in ← dir.readDir do
-      let info ← entry.path.symlinkMetadata
-      match info.type with
-      | .file => pure ()
-      | .dir =>
-        stack := stack.push entry.path
-        children := children.push entry.path
-      | .symlink => links := links.push (entry.path, info.byteSize)
-      | .other => throw <| IO.userError s!"Cannot isolate a special file: {entry.path}."
-    edges := edges.insert dir children
-  let mut directoryLinks := false
+  for path in paths do
+    let info ← path.symlinkMetadata
+    if info.type == .file then continue
+    unless info.type == .symlink do throw <| IO.userError s!"Cannot isolate a special file: {path}."
+    links := links.push (path, info.byteSize)
+  let mut edges : Edges := ∅
+  let mut seen : Std.HashSet FilePath := ∅
   for start in [0:links.size:32] do
     let batch := links.extract start (start + 32)
     for (link, _) in batch, target in ← readLinkTargets batch do
-      if let some dir ← directoryTarget? root link ⟨target⟩ then
-        edges := edges.modify link.parent.get! (·.push dir)
-        directoryLinks := true
-  if directoryLinks then checkDirectoryCycles edges
+      let some dir ← directoryTarget? root link ⟨target⟩ | continue
+      let parent := link.parent.get!
+      edges := edges.alter parent fun dirs => some ((dirs.getD #[]).push dir)
+      -- Only a directory link and its ancestors can participate in a traversal cycle.
+      for endpoint in [parent, dir] do
+        let mut child := endpoint
+        while child != root && !seen.contains child do
+          seen := seen.insert child
+          let ancestor := child.parent.get!
+          edges := edges.alter ancestor fun dirs => some ((dirs.getD #[]).push child)
+          child := ancestor
+  unless edges.isEmpty do checkDirectoryCycles edges
 
 private def copyBatches (batches : Array (Array String × FilePath)) : IO Unit := do
   -- Each batch has distinct destination files. cp preserves modes and copies links verbatim.
@@ -119,6 +124,8 @@ def copyTrialSources (source destination packagesDir : FilePath)
   let mut stack := #[(source, destination)]
   let mut totalBytes := 0
   let mut hasModuleCache := false
+  -- Inspect small copies directly. Large copies avoid retaining one path per file.
+  let mut copiedFiles : Option (Array FilePath) := some #[]
   let mut batches := #[]
   while let some (dir, toDir) := stack.back? do
     stack := stack.pop
@@ -149,6 +156,8 @@ def copyTrialSources (source destination packagesDir : FilePath)
         stack := stack.push (entry.path, subDir)
       | .other => throw <| IO.userError s!"Cannot isolate a special file: {entry.path}."
       | .file | .symlink =>
+        if let some paths := copiedFiles then
+          copiedFiles := if paths.size < 8192 then some (paths.push (toDir / entry.fileName)) else none
         if !hasModuleCache then
           hasModuleCache := entry.fileName.endsWith ".ltar" || (entry.fileName.endsWith ".olean" &&
             onDisk.get.contains ((entry.fileName.dropSuffix ".olean").copy ++ ".trace"))
@@ -163,7 +172,7 @@ def copyTrialSources (source destination packagesDir : FilePath)
           argBytes := 0
     unless files.isEmpty do batches := batches.push (files, toDir)
   copyBatches batches
-  validateSnapshot destination
+  validateSnapshot destination copiedFiles
   return hasModuleCache
 
 def copySources (source destination : FilePath) (packagesDir : FilePath := ".lake/packages")

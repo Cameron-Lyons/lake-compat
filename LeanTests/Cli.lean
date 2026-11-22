@@ -73,6 +73,7 @@ private def inputErrors : IO Unit := withProject fun project => do
       #["--build-target"], #["--build-target="], #["--build-target=--help"], #["--build-target", "@dep/"],
       #["--build-target", "CoreLib:olean:extra"], #["--build-target", "./CoreLib.lean:olean:extra"],
       #["--build-target", "./CoreLib.toml"], #["--build-target", "@dep:"], #["--build-target", ":"],
+      #["--build-target", ":.."], #["--build-target", "CoreLib:extra..dep"],
       #["--try-revision", "lib=" ++ oldRev, "--try-revision", "lib=" ++ newRev]] do
     discard <| expectError project args ""
   let positional ← cli #["4.36.0", "--", "--json"]
@@ -170,7 +171,7 @@ private def namedTargets : IO Unit := withTempDir fun project => do
   IO.FS.createDir dep
   IO.FS.writeFile (project / "lakefile.toml") <|
     "name = \"app\"\n[[lean_lib]]\nname = \"CoreLib\"\n[[require]]\nname = \"dep\"\npath = \"dep\"\n"
-  IO.FS.writeFile (dep / "lakefile.toml") "name = \"dep\"\n[[lean_lib]]\nname = \"Extra\"\n"
+  IO.FS.writeFile (dep / "lakefile.toml") "name = \"dep\"\ndefaultTargets = [\"Extra\"]\n[[lean_lib]]\nname = \"Extra\"\n"
   writeJson (dep / "lake-manifest.json") (projectLock #[] "dep")
   -- Lake ignores a leftover Git subdirectory on a path entry.
   let entry := Json.mkObj [("name", "dep"), ("type", "path"), ("dir", "dep"),
@@ -195,6 +196,13 @@ private def namedTargets : IO Unit := withTempDir fun project => do
   let passed ← jsonResult (← cli (args.push "--json")) 0
   check (passed.getObjValD "build_targets" == toJson targets &&
     (passed.getObjValD "verification").getObjValD "status" == "passed") passed.compress
+  let defaults ← jsonResult (← cli ((build #["@«dep»"]).push "--json")) 0
+  check (defaults.getObjValD "build_targets" == toJson ["@«dep»"]) defaults.compress
+  IO.FS.writeFile (dep / "Extra.lean") "example : Nat := false\n"
+  let broken ← cli (build #["@dep"])
+  expectCode broken 1
+  check (broken.stdout.contains "Extra.lean") broken.stdout
+  IO.FS.writeFile (dep / "Extra.lean") "example : Nat := 1\n"
   IO.FS.writeFile (dep / "lean-toolchain") "leanprover/lean4:v4.34.1\n"
   let named := build #["CoreLib", "@dep/+Extra:olean", "./CoreLib/Sub.lean:olean"]
   let strict ← jsonResult (← cli (named ++ #["--strict", "--json"])) 1
@@ -206,6 +214,13 @@ private def namedTargets : IO Unit := withTempDir fun project => do
   IO.FS.createDir (dep / "OnlyHere")
   IO.FS.writeFile (dep / "OnlyHere/lean.lean") "example : True := trivial\n"
   expectCode (← cli (build #["@dep/OnlyHere.lean"])) 0
+  let missingFile ← cli (build #["dep/OnlyHere.lean"])
+  expectCode missingFile 1
+  check (missingFile.stdout.contains "dep/OnlyHere.lean") missingFile.stdout
+  let noDefaults ← jsonResult (← cli ((build #["CoreLib", "@dep"]).push "--json")) 2
+  let checkResult := noDefaults.getObjValD "verification"
+  check (checkResult.getObjValD "status" == "inconclusive" &&
+    (LakeCompat.Report.string checkResult "message").contains "dep has no default build targets") noDefaults.compress
   let absent ← cli (build #["OnlyHere.lean"])
   expectCode absent 1
   check (absent.stdout.contains "OnlyHere.lean" && absent.stdout.contains "package 'app'") absent.stdout

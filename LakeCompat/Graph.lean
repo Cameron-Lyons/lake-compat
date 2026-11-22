@@ -25,8 +25,17 @@ private structure Repositories where
   exact : RepoMap
   folded : Std.HashMap String (List FilePath)
 
-private def fileText? (file : FilePath) : IO (Option String) := do
-  try return some (← IO.FS.readFile file)
+private def metadataText (file : FilePath) (boundary : Option FilePath := none) : IO String := do
+  unless (← file.metadata).type == .file do throw <| IO.userError s!"Expected a regular file at {file}."
+  if let some root := boundary then
+    let path ← IO.FS.realPath file
+    unless (GitTree.relativeTo? root path).isSome do
+      throw <| IO.userError s!"{file} leaves the repository at {root}."
+    return ← IO.FS.readFile path
+  IO.FS.readFile file
+
+private def fileText? (boundary : Option FilePath) (file : FilePath) : IO (Option String) := do
+  try return some (← metadataText file boundary)
   catch
     | .noFileOrDirectory .. => return none
     | e => throw e
@@ -77,6 +86,7 @@ private structure Located extends SourcePath where
 private structure DirectoryQuery (α : Type) extends SourcePath where
   key : α
   gitRepo : Option FilePath := none
+  archive : Option FilePath := none
   workspaceLinks : Nat := 0
   issues : Array Issue := #[]
 
@@ -154,7 +164,7 @@ private def enterCheckout (repos : Repositories) (alias : FilePath) (q : Directo
   let some suffix := GitTree.relativeTo? alias q.path
     | throw <| IO.userError s!"{q.path} leaves the locked repository {alias}"
   let path := if suffix.isEmpty then checkout.repo else checkout.repo / suffix
-  return ({q with path}, some checkout)
+  return ({q with path, archive := none}, some checkout)
 
 /-- Resolve workspace prefixes until we reach a locked checkout. Its remaining components,
     including any '..' after a committed symlink, are interpreted by the Git reader. -/
@@ -164,7 +174,13 @@ private def locatePath (repos : Repositories) (cache : PrefixCache) (q : Directo
   if let some checkout := q.origin then return (q, some checkout)
   let p := q.path
   if repos.exact.isEmpty then return ({q with path := ← resolvePath p}, none)
-  let (root, parts) := rootParts p
+  -- Continue inside an unverified checkout with filesystem semantics. Stop again if a
+  -- path enters another locked checkout, before resolving that checkout's suffix.
+  let (root, parts) ← match q.archive with
+    | none => pure (rootParts p)
+    | some root => do
+      let some suffix := GitTree.relativeTo? root p | throw <| IO.userError s!"{p} leaves the archive at {root}"
+      pure (root, (FilePath.mk suffix).components)
   let mut dir := root
   let mut rest := parts
   let mut links := q.workspaceLinks
@@ -190,7 +206,7 @@ private def locatePath (repos : Repositories) (cache : PrefixCache) (q : Directo
         continue
     let mut ancestor := dir
     repeat
-      if repos.exact.contains ancestor then
+      if some ancestor != q.archive && repos.exact.contains ancestor then
         let path := tail.foldl (fun path (part : String) => path / part) dir
         return ← enterCheckout repos ancestor {q with path, workspaceLinks := links}
       -- Windows realPath can resolve an entire link target inside a repository at once.
@@ -228,8 +244,8 @@ private def readPackage (p : Located) (workspaceRoot : FilePath) (repo : Option 
   try
     let some contents ← readText file | return { obs with issues := issues.push (
       "missing_manifest", s!"Dependency pins are unknown because {manifest} is missing.") }
-    let lock ← IO.ofExcept (Lock.parse file contents)
-    return { obs with fixedToolchain := some lock.fixedToolchain, edges := lock.packages.filter fun _ e => !e.inherited }
+    let lock ← IO.ofExcept (Lock.parse file contents (directOnly := true))
+    return { obs with fixedToolchain := some lock.fixedToolchain, edges := lock.packages }
   catch e => return { obs with issues := issues.push ("invalid_manifest", s!"Cannot inspect the package manifest: {e}") }
 
 private def missing (p : Located) : Observation :=
@@ -237,7 +253,7 @@ private def missing (p : Located) : Observation :=
 
 private structure Directory extends SourcePath where
   repo : Option FilePath := none
-  readText : ReadText := fileText?
+  readText : ReadText
   issues : Array Issue := #[]
 
 private abbrev Inspect (α β : Type) := DirectoryQuery α → Except Issue Directory → IO β
@@ -261,13 +277,17 @@ private def inspectGit (repo : FilePath) (revision : String) (env : GitTree.Env)
     return ← group.mapM fun q => finish q (.error ("missing_checkout", s!"Package directory is missing: {q.path}"))
   let fallback := fun () => do
     let boundary ← IO.FS.realPath repo
+    let issue := ("unknown_checkout_revision",
+      s!"Could not verify Git revision {revision} for {repo}. The available metadata comes from the working directory.")
     group.mapM fun q => do
+      if q.gitRepo.isNone then
+        let issues := if q.issues.contains issue then q.issues else q.issues.push issue
+        return .inl {q with origin := none, archive := some boundary, issues}
       let .ok path ← (resolvePath q.path).toBaseIO
         | return ← finish q (.error ("unknown_package_directory", s!"Cannot resolve {q.path}"))
-      if (GitTree.relativeTo? boundary path).isNone && q.gitRepo.isSome then
+      if (GitTree.relativeTo? boundary path).isNone then
         return ← finish q (.error ("unknown_package_directory", s!"Package directory leaves the repository: {q.path}"))
-      finish q (.ok { path, repo := some boundary, issues := #[("unknown_checkout_revision",
-        s!"Could not verify Git revision {revision} for {repo}. The available metadata comes from the working directory.")] })
+      finish q (.ok { path, repo := some boundary, readText := fileText? (some boundary), issues := #[issue] })
   unless ← (repo / ".git").pathExists do return ← fallback ()
   let batch ← (GitTree.withReader repo env fun git => do
     let head ← git.head?
@@ -315,7 +335,8 @@ private def inspectDirectories (repos : Repositories) (env : GitTree.Env)
       if let some repo := repo then
         groups := groups.alter repo fun group => some ((group.getD #[]).push q)
       else
-        results := results.push (← inspect q (.ok { path := q.path }))
+        let boundary := q.archive.filter fun root => (GitTree.relativeTo? root q.path).isSome
+        results := results.push (← inspect q (.ok { path := q.path, repo := boundary, readText := fileText? boundary }))
     pending := #[]
     let batches ← mapConcurrent groups.toArray fun (checkout, group) =>
       inspectGit checkout.repo checkout.revision env group inspect
@@ -362,7 +383,7 @@ private def observe (project packages workspaceRoot : FilePath) (lock : Lock) (r
       queries := queries.push {key := entry, path := subDir.elim repo (repo / ·), gitRepo := some repo}
     | .path dir copy =>
       queries := queries.push {key := entry, path := if copy then packages / name else project / dir}
-  let workspaceText ← cacheToolchains fileText?
+  let workspaceText ← cacheToolchains (fileText? none)
   let observations ← inspectDirectories repos env queries fun q result => do
     let obs ← match result with
       | .error (kind, message) => pure (problem ⟨q.toSourcePath, q.key⟩ kind message)
@@ -534,7 +555,7 @@ def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Jso
   let project ← IO.FS.realPath project
   let target ← IO.ofExcept (normalizeToolchain target)
   let file := project / manifestName
-  let raw ← IO.ofExcept ((Json.parse (← IO.FS.readFile file)).mapError (s!"{file}: {·}"))
+  let raw ← IO.ofExcept ((Json.parse (← metadataText file)).mapError (s!"{file}: {·}"))
   let lock ← IO.ofExcept (Lock.ofJson file raw)
   let dirname := project.fileName.getD "[anonymous]"
   let root := lock.name.getD dirname
@@ -542,7 +563,7 @@ def analyzeWithManifest (project : FilePath) (target : String) : IO (Json × Jso
   let lakeDir := project / lock.lakeDir
   let packagesDir ← resolvePath (lock.packagesDir.elim (lakeDir / "packages") (project / ·))
   -- A nested Lake project can share its enclosing workspace's elan toolchain.
-  let rootPin ← nearestPin project fileText?
+  let rootPin ← nearestPin project (fileText? none)
   let workspaceRoot := (rootPin.map Prod.snd).getD project
   let repos ← repositories packagesDir lock
   let env ← if repos.exact.isEmpty then pure #[] else GitTree.environment

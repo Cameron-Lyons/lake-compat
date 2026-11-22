@@ -158,7 +158,10 @@ private def indexBuilds (initial : Index) (builds : Array Json) (target : String
   for row in builds do
     unless matchesTarget row target do continue
     let some rev := revision? row | continue
-    let .bool built := row.getObjValD "built" | throw .invalid
+    let .ok outcome := row.getObjVal? "built" | throw .invalid
+    -- Reservoir uses an explicit null when it has no build outcome for this run.
+    if outcome.isNull then continue
+    let .bool built := outcome | throw .invalid
     let tested : Option Bool ← optionalField row "tested"
     let build : Build := {
       runAt := (← optionalField row "runAt").getD ""

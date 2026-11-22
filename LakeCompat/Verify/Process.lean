@@ -85,7 +85,7 @@ def trialEnvironment (target : String) (parent : FilePath) : IO Environment := d
     if ["LEAN_", "LAKE_", "GIT_"].any (name.startsWith ·) || name == "LEAN" || name == "LAKE" then
       some (name, none) else none
   let added : Array (String × String) := #[("ELAN_TOOLCHAIN", target), ("GIT_TERMINAL_PROMPT", "0"),
-    ("GIT_CEILING_DIRECTORIES", parent.toString), ("LAKE_NO_CACHE", "true"),
+    ("GIT_CEILING_DIRECTORIES", parent.toString), ("GIT_DEFAULT_HASH", "sha1"), ("LAKE_NO_CACHE", "true"),
     ("LAKE_ARTIFACT_CACHE", "false"), ("LAKE_CACHE_DIR", (parent / "cache").toString)]
   return removed ++ added.map fun (k, v) => (k, some v)
 

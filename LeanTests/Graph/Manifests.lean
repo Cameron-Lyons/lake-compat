@@ -174,6 +174,18 @@ private def invalidNestedLock (project : FilePath) : IO Unit := do
     writeJson file value
     expectKinds (← report project) #["active_overrides", "invalid_manifest"]
 
+private def inheritedEntries (project : FilePath) : IO Unit := do
+  manifest project #[localDep "parent" "parent"]
+  let parent := project / "parent"
+  let direct := localDep "library" "library"
+  let inherited := localDep "library" "library" true
+  manifest parent #[inherited]
+  expectKinds (← report project) #[]
+  for entries in [#[inherited, direct], #[direct, inherited], #[inherited, inherited],
+      #[inherited.setObjVal! "dir" (.bool false)]] do
+    manifest parent entries
+    expectKinds (← report project) #["invalid_manifest"]
+
 private def legacyManifest (project : FilePath) : IO Unit := do
   let repo := project / "lake-packages" / "my-lib"
   let lib := repo / "sub"
@@ -248,6 +260,7 @@ def run : IO Unit := do
   runCase "null Lake manifest defaults" nullDefaults
   runCase "unreachable parent edges" orphanEdges
   runCase "invalid nested lock and active overrides" invalidNestedLock
+  runCase "validation of inherited manifest entries" inheritedEntries
   runCase "legacy tagged manifest" legacyManifest
   runCase "semantic manifest versions" versionFormats
   runCase "escaped package name" quotedName
